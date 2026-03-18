@@ -3,6 +3,22 @@ import pandas as pd
 
 app = Flask(__name__)
 
+def leer_csv_flexible(archivo):
+    separadores = [",", ";"]
+    codificaciones = ["utf-8", "latin1", "cp1252"]
+
+    ultimo_error = None
+
+    for enc in codificaciones:
+        for sep in separadores:
+            try:
+                archivo.seek(0)
+                return pd.read_csv(archivo, sep=sep, encoding=enc)
+            except Exception as e:
+                ultimo_error = e
+
+    raise ultimo_error
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "POST":
@@ -23,17 +39,8 @@ def index():
                 <a href="/">Volver</a>
                 """
 
-            try:
-                df_s = pd.read_csv(sensores)
-            except:
-                sensores.seek(0)
-                df_s = pd.read_csv(sensores, sep=";")
-
-            try:
-                df_h = pd.read_csv(historico)
-            except:
-                historico.seek(0)
-                df_h = pd.read_csv(historico, sep=";")
+            df_s = leer_csv_flexible(sensores)
+            df_h = leer_csv_flexible(historico)
 
             if "can fuel level 1%" not in df_s.columns:
                 return f"""

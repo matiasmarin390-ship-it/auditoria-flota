@@ -1,26 +1,22 @@
 from flask import Flask, request
 import pandas as pd
 import io
+import math
 from html import escape
 
 app = Flask(__name__)
 
 # =========================
-# CONFIGURACIÓN DE REGLAS
+# CONFIGURACIÓN
 # =========================
-LIMITE_VELOCIDAD = 80  # km/h, ajustable
-RALENTI_MINUTOS_EVENTO = 10
-RALENTI_MINUTOS_PENALIZA = 15
-CONSUMO_ESPERADO_L100 = 35  # ajustar según vehículo
-ACEL_80_PENALIZA = 3
-ACEL_90_PENALIZA = 5
-RALENTI_PENALIZA = 4
-EXCESO_VEL_PENALIZA = 6
-CONSUMO_ALTO_PENALIZA = 5
-
+UMBRAL_DETENCION_MIN = 5
+UMBRAL_CAMBIO_COMBUSTIBLE = 5.0
+VENTANA_COMBUSTIBLE_MIN = 5
+DISTANCIA_BASE_METROS = 300
+DISTANCIA_DESVIO_METROS = 800
 
 # =========================
-# LECTURA FLEXIBLE CSV
+# LECTURA FLEXIBLE
 # =========================
 def leer_csv_flexible(archivo):
     separadores = [",", ";", "\t", "|"]
@@ -57,342 +53,433 @@ def leer_csv_flexible(archivo):
 
     raise Exception("No se pudo interpretar el archivo CSV.")
 
-
 # =========================
 # UTILIDADES
 # =========================
-def normalizar_texto(x):
+def norm(x):
     return str(x).strip().lower() if pd.notna(x) else ""
 
-
 def buscar_columna(df, candidatos):
-    cols_norm = {normalizar_texto(c): c for c in df.columns}
+    cols = list(df.columns)
+    cols_norm = {norm(c): c for c in cols}
     for cand in candidatos:
-        cand_n = normalizar_texto(cand)
+        cn = norm(cand)
         for c_norm, c_real in cols_norm.items():
-            if cand_n == c_norm or cand_n in c_norm:
+            if cn == c_norm or cn in c_norm:
                 return c_real
     return None
 
-
-def formatear_hora(dt):
-    if pd.isna(dt):
+def fmt_fecha(x):
+    if pd.isna(x):
         return "-"
-    return pd.to_datetime(dt).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def clasificar_agresividad(valor):
-    if pd.isna(valor):
-        return "No disponible"
-    if valor > 90:
-        return "Agresivo"
-    if valor > 80:
-        return "Moderado"
-    return "Leve"
-
-
-def horas_con_mas_eventos(df, col_fecha):
-    if df.empty or col_fecha not in df.columns:
-        return "-"
-    horas = pd.to_datetime(df[col_fecha], errors="coerce").dt.hour.dropna()
-    if horas.empty:
-        return "-"
-    h = horas.value_counts().idxmax()
-    return f"{int(h):02d}:00 - {int(h):02d}:59"
-
-
-def score_final(
-    score,
-    cant_acel_80,
-    cant_acel_90,
-    cant_ralenti_15,
-    cant_excesos_vel,
-    consumo_l100
-):
-    score -= cant_acel_80 * ACEL_80_PENALIZA
-    score -= cant_acel_90 * ACEL_90_PENALIZA
-    score -= cant_ralenti_15 * RALENTI_PENALIZA
-    score -= cant_excesos_vel * EXCESO_VEL_PENALIZA
-
-    if pd.notna(consumo_l100) and CONSUMO_ESPERADO_L100 > 0:
-        if consumo_l100 > CONSUMO_ESPERADO_L100 * 1.2:
-            score -= CONSUMO_ALTO_PENALIZA
-
-    return max(0, round(score, 2))
-
-
-def interpretar_score(score):
-    if score >= 85:
-        return "Conducción controlada / riesgo bajo"
-    if score >= 65:
-        return "Conducción con observaciones / riesgo medio"
-    return "Conducción agresiva / riesgo alto"
-
-
-def nivel_riesgo(score):
-    if score >= 85:
-        return "Bajo"
-    if score >= 65:
-        return "Medio"
-    return "Alto"
-
-
-def estado_mecanico(alertas_mecanicas):
-    if alertas_mecanicas >= 3:
-        return "Crítico"
-    if alertas_mecanicas >= 1:
-        return "Observación"
-    return "Normal"
-
+    return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M:%S")
 
 def html_tabla(df, index=False):
     if df is None or df.empty:
         return "<p>Sin datos.</p>"
     return df.to_html(index=index, border=1)
 
-
-def sensor_warning(nombre):
-    return f"⚠ Sensor sin datos confiables – requiere revisión técnica: {escape(nombre)}"
-
-
-# =========================
-# PREPARACIÓN DE DATOS
-# =========================
-def preparar_sensores(df_s):
-    col_sensor = buscar_columna(df_s, ["Sensor", "sensor"])
-    col_fecha = buscar_columna(df_s, ["Fecha", "fecha", "datetime", "time"])
-    col_valor = buscar_columna(df_s, ["Valor", "valor", "value"])
-
-    if not col_sensor or not col_fecha or not col_valor:
-        raise Exception(
-            f"El archivo de sensores debe contener columnas tipo Sensor/Fecha/Valor. Detectadas: {list(df_s.columns)}"
-        )
-
-    df = df_s.copy()
-    df[col_sensor] = df[col_sensor].astype(str).str.strip()
-    df[col_fecha] = pd.to_datetime(df[col_fecha], errors="coerce")
-    df[col_valor] = pd.to_numeric(df[col_valor], errors="coerce")
-    df = df.dropna(subset=[col_fecha])
-
-    return df, col_sensor, col_fecha, col_valor
-
-
-def pivotear_sensores(df, col_sensor, col_fecha, col_valor):
-    tabla = df.pivot_table(
-        index=col_fecha,
-        columns=col_sensor,
-        values=col_valor,
-        aggfunc="last"
-    ).reset_index()
-
-    tabla = tabla.sort_values(col_fecha)
-    return tabla
-
-
-def preparar_historico(df_h):
-    col_fecha = buscar_columna(df_h, ["Fecha", "fecha", "datetime", "time"])
-    col_lat = buscar_columna(df_h, ["Latitud", "latitud", "latitude", "lat"])
-    col_lon = buscar_columna(df_h, ["Longitud", "longitud", "longitude", "lon", "lng"])
-    col_vel = buscar_columna(df_h, ["Velocidad", "velocidad", "speed"])
-
-    df = df_h.copy()
-    if col_fecha:
-        df[col_fecha] = pd.to_datetime(df[col_fecha], errors="coerce")
-        df = df.dropna(subset=[col_fecha])
-
-    if col_vel:
-        df[col_vel] = pd.to_numeric(df[col_vel], errors="coerce")
-
-    if col_lat:
-        df[col_lat] = pd.to_numeric(df[col_lat], errors="coerce")
-    if col_lon:
-        df[col_lon] = pd.to_numeric(df[col_lon], errors="coerce")
-
-    return df, col_fecha, col_lat, col_lon, col_vel
-
-
-# =========================
-# CÁLCULOS
-# =========================
-def detectar_columnas_clave(tabla):
-    cols = list(tabla.columns)
-
-    def pick(cands):
-        for c in cols:
-            cn = normalizar_texto(c)
-            for cand in cands:
-                if normalizar_texto(cand) in cn:
-                    return c
+def haversine_m(lat1, lon1, lat2, lon2):
+    if any(pd.isna(v) for v in [lat1, lon1, lat2, lon2]):
         return None
+    R = 6371000
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-    return {
-        "fecha": buscar_columna(tabla, ["Fecha", "fecha"]),
-        "combustible_total": pick(["consumo total de combustible", "total fuel", "fuel consumed", "fuel total"]),
-        "fuel_level": pick(["can fuel level 1%", "fuel level", "nivel de combustible", "combustible"]),
-        "velocidad": pick(["velocidad", "obd vehicle speed", "wheel based speed", "speed"]),
-        "rpm": pick(["rpm", "engine rpm"]),
-        "temperatura": pick(["temperatura", "coolant temp", "engine temperature"]),
-        "pedal": pick(["pedal", "accelerator", "throttle"]),
-        "freno_brusco": pick(["brake", "frenada", "harsh brake"]),
-        "motor": pick(["ignition", "motor", "engine status", "encendido"]),
-        "distancia": pick(["distance", "odometer", "km", "recorrido"])
+def aproximar_ubicacion(lat, lon):
+    if pd.isna(lat) or pd.isna(lon):
+        return "Ubicación no disponible"
+    return f"Lat {round(lat, 6)}, Lon {round(lon, 6)}"
+
+def franja_horaria(dt):
+    if pd.isna(dt):
+        return "-"
+    h = pd.to_datetime(dt).hour
+    return f"{h:02d}:00 - {h:02d}:59"
+
+# =========================
+# PREPARACIÓN GPS
+# =========================
+def preparar_gps(df):
+    col_fecha = buscar_columna(df, ["fecha", "datetime", "time"])
+    col_lat = buscar_columna(df, ["latitud", "latitude", "lat"])
+    col_lon = buscar_columna(df, ["longitud", "longitude", "lon", "lng"])
+    col_vel = buscar_columna(df, ["velocidad", "speed"])
+    col_dir = buscar_columna(df, ["direccion", "address", "ubicacion", "location"])
+
+    if not col_fecha or not col_lat or not col_lon:
+        raise Exception(f"El archivo GPS debe tener fecha, latitud y longitud. Detectadas: {list(df.columns)}")
+
+    gps = df.copy()
+    gps[col_fecha] = pd.to_datetime(gps[col_fecha], errors="coerce")
+    gps[col_lat] = pd.to_numeric(gps[col_lat], errors="coerce")
+    gps[col_lon] = pd.to_numeric(gps[col_lon], errors="coerce")
+    if col_vel:
+        gps[col_vel] = pd.to_numeric(gps[col_vel], errors="coerce")
+    gps = gps.dropna(subset=[col_fecha, col_lat, col_lon]).sort_values(col_fecha).reset_index(drop=True)
+
+    # Distancia incremental
+    gps["_dist_m"] = 0.0
+    for i in range(1, len(gps)):
+        d = haversine_m(
+            gps.loc[i - 1, col_lat], gps.loc[i - 1, col_lon],
+            gps.loc[i, col_lat], gps.loc[i, col_lon]
+        )
+        gps.loc[i, "_dist_m"] = d if d is not None else 0.0
+
+    gps["_dist_km"] = gps["_dist_m"] / 1000.0
+
+    # Movimiento
+    if col_vel:
+        gps["_mov"] = gps[col_vel].fillna(0) > 3
+    else:
+        gps["_mov"] = gps["_dist_m"] > 20
+
+    return gps, {
+        "fecha": col_fecha,
+        "lat": col_lat,
+        "lon": col_lon,
+        "vel": col_vel,
+        "dir": col_dir
     }
 
+# =========================
+# PREPARACIÓN SENSORES
+# =========================
+def preparar_sensores(df):
+    col_sensor = buscar_columna(df, ["sensor"])
+    col_fecha = buscar_columna(df, ["fecha", "datetime", "time"])
+    col_valor = buscar_columna(df, ["valor", "value"])
 
-def calcular_distancia(df_hist, col_lat, col_lon):
-    # Aproximación simple por diferencias lat/lon no implementada;
-    # si existiera columna de distancia/odómetro se debería usar.
-    # Devolvemos NaN para no inventar datos.
-    return pd.NA
+    if not col_sensor or not col_fecha or not col_valor:
+        raise Exception(f"El archivo de sensores debe contener Sensor, Fecha y Valor. Detectadas: {list(df.columns)}")
 
+    s = df.copy()
+    s[col_sensor] = s[col_sensor].astype(str).str.strip()
+    s[col_fecha] = pd.to_datetime(s[col_fecha], errors="coerce")
+    s[col_valor] = pd.to_numeric(s[col_valor], errors="coerce")
+    s = s.dropna(subset=[col_fecha]).sort_values(col_fecha).reset_index(drop=True)
 
-def consumo_total(tabla, col_combustible_total):
-    if not col_combustible_total or col_combustible_total not in tabla.columns:
-        return pd.NA
-    serie = pd.to_numeric(tabla[col_combustible_total], errors="coerce").dropna()
-    if serie.empty:
-        return pd.NA
-    return round(float(serie.max() - serie.min()), 2)
-
-
-def detectar_aceleraciones(df, col_fecha, col_pedal):
-    if not col_pedal or col_pedal not in df.columns:
-        return pd.DataFrame(), pd.DataFrame()
-
-    aux = df[[col_fecha, col_pedal]].copy()
-    aux[col_pedal] = pd.to_numeric(aux[col_pedal], errors="coerce")
-    acel80 = aux[aux[col_pedal] > 80].copy()
-    acel90 = aux[aux[col_pedal] > 90].copy()
-    return acel80, acel90
-
-
-def detectar_exceso_velocidad(df, col_fecha, col_vel):
-    if not col_vel or col_vel not in df.columns:
-        return pd.DataFrame(), pd.NA, "-"
-    aux = df[[col_fecha, col_vel]].copy()
-    aux[col_vel] = pd.to_numeric(aux[col_vel], errors="coerce")
-    vmax = aux[col_vel].max() if not aux.empty else pd.NA
-
-    if pd.notna(vmax):
-        fila_max = aux.loc[aux[col_vel].idxmax()]
-        hora_max = formatear_hora(fila_max[col_fecha])
-    else:
-        hora_max = "-"
-
-    excesos = aux[aux[col_vel] > LIMITE_VELOCIDAD].copy()
-    return excesos, vmax, hora_max
-
-
-def detectar_ralenti(df, col_fecha, col_vel, col_motor):
-    if not col_fecha:
-        return pd.DataFrame(), 0
-
-    aux = df.copy()
-
-    if col_vel and col_vel in aux.columns:
-        aux[col_vel] = pd.to_numeric(aux[col_vel], errors="coerce")
-    else:
-        return pd.DataFrame(), 0
-
-    motor_on = None
-    if col_motor and col_motor in aux.columns:
-        motor_on = aux[col_motor]
-        aux["_motor_on"] = motor_on.astype(str).str.lower().isin(["1", "true", "on", "encendido"])
-    else:
-        # Si no hay motor, estimamos ralentí solo con velocidad cero
-        aux["_motor_on"] = True
-
-    aux["_ralenti"] = (aux[col_vel].fillna(0) == 0) & (aux["_motor_on"] == True)
-    aux = aux.sort_values(col_fecha).copy()
-
-    eventos = []
-    en_evento = False
-    inicio = None
-    fin = None
-
-    for _, row in aux.iterrows():
-        activo = bool(row["_ralenti"])
-        fecha = row[col_fecha]
-
-        if activo and not en_evento:
-            inicio = fecha
-            fin = fecha
-            en_evento = True
-        elif activo and en_evento:
-            fin = fecha
-        elif not activo and en_evento:
-            dur = (fin - inicio).total_seconds() / 60 if pd.notna(fin) and pd.notna(inicio) else 0
-            eventos.append([inicio, fin, round(dur, 2)])
-            en_evento = False
-
-    if en_evento and inicio is not None and fin is not None:
-        dur = (fin - inicio).total_seconds() / 60
-        eventos.append([inicio, fin, round(dur, 2)])
-
-    df_eventos = pd.DataFrame(eventos, columns=["Inicio", "Fin", "Minutos"])
-    tiempo_total = round(df_eventos["Minutos"].sum(), 2) if not df_eventos.empty else 0
-    return df_eventos, tiempo_total
-
-
-def detectar_frenadas(df, col_fecha, col_freno):
-    if not col_freno or col_freno not in df.columns:
-        return pd.DataFrame()
-    aux = df[[col_fecha, col_freno]].copy()
-    aux[col_freno] = pd.to_numeric(aux[col_freno], errors="coerce")
-    return aux[aux[col_freno] > 0].copy()
-
-
-def detectar_alertas_mecanicas(df, col_vel, col_rpm, col_temp, col_pedal):
-    alertas = []
-
-    if col_rpm and col_rpm in df.columns:
-        rpm = pd.to_numeric(df[col_rpm], errors="coerce")
-        if (rpm > 3000).sum() > 0:
-            alertas.append("Sobre-revoluciones detectadas")
-        if rpm.fillna(0).eq(0).mean() > 0.9:
-            alertas.append(sensor_warning("RPM"))
-
-    else:
-        alertas.append(sensor_warning("RPM"))
-
-    if col_temp and col_temp in df.columns:
-        temp = pd.to_numeric(df[col_temp], errors="coerce")
-        if (temp > 105).sum() > 0:
-            alertas.append("Temperatura de motor fuera de rango")
-        if temp.fillna(0).eq(0).mean() > 0.9:
-            alertas.append(sensor_warning("Temperatura motor"))
-    else:
-        alertas.append(sensor_warning("Temperatura motor"))
-
-    if col_vel and col_pedal and col_vel in df.columns and col_pedal in df.columns:
-        vel = pd.to_numeric(df[col_vel], errors="coerce")
-        pedal = pd.to_numeric(df[col_pedal], errors="coerce")
-
-        if ((vel > 5) & (pedal.fillna(0) == 0)).sum() > 0:
-            alertas.append("Movimientos sin aceleración detectados")
-
-        if ((pedal > 20) & (vel.fillna(0) == 0)).sum() > 0:
-            alertas.append("Aceleración sin movimiento detectada")
-    else:
-        alertas.append(sensor_warning("Velocidad/Pedal"))
-
-    return alertas
-
-
-def franja_mayor_valor(df, fecha_col, valor_col):
-    if df.empty or fecha_col not in df.columns or valor_col not in df.columns:
-        return "-"
-    aux = df.copy()
-    aux["hora"] = pd.to_datetime(aux[fecha_col], errors="coerce").dt.hour
-    grp = aux.groupby("hora")[valor_col].sum(numeric_only=True)
-    if grp.empty:
-        return "-"
-    h = grp.idxmax()
-    return f"{int(h):02d}:00 - {int(h):02d}:59"
-
+    return s, {
+        "sensor": col_sensor,
+        "fecha": col_fecha,
+        "valor": col_valor
+    }
 
 # =========================
-# ARMADO DEL INFORME
+# BASE OPERATIVA
+# =========================
+def detectar_base_operativa(gps, m):
+    fecha = m["fecha"]
+    lat = m["lat"]
+    lon = m["lon"]
+
+    dets = detectar_detenciones(gps, m)
+    if dets.empty:
+        return None, dets
+
+    dets = dets.sort_values("Duración_min", ascending=False).reset_index(drop=True)
+    base = dets.iloc[0]
+    return {
+        "lat": base["Lat"],
+        "lon": base["Lon"],
+        "inicio": base["Inicio"],
+        "fin": base["Fin"],
+        "duracion_min": base["Duración_min"],
+        "ubicacion": base["Ubicación_aprox"]
+    }, dets
+
+# =========================
+# DETENCIONES
+# =========================
+def detectar_detenciones(gps, m):
+    fecha = m["fecha"]
+    lat = m["lat"]
+    lon = m["lon"]
+
+    eventos = []
+    en_det = False
+    ini_idx = None
+
+    for i, row in gps.iterrows():
+        detenido = not bool(row["_mov"])
+        if detenido and not en_det:
+            en_det = True
+            ini_idx = i
+        elif not detenido and en_det:
+            fin_idx = i - 1
+            ini = gps.loc[ini_idx, fecha]
+            fin = gps.loc[fin_idx, fecha]
+            mins = (fin - ini).total_seconds() / 60
+            if mins >= UMBRAL_DETENCION_MIN:
+                lat_m = gps.loc[ini_idx:fin_idx, lat].mean()
+                lon_m = gps.loc[ini_idx:fin_idx, lon].mean()
+                eventos.append([
+                    ini, fin, round(mins, 2), lat_m, lon_m, aproximar_ubicacion(lat_m, lon_m)
+                ])
+            en_det = False
+
+    if en_det and ini_idx is not None:
+        fin_idx = len(gps) - 1
+        ini = gps.loc[ini_idx, fecha]
+        fin = gps.loc[fin_idx, fecha]
+        mins = (fin - ini).total_seconds() / 60
+        if mins >= UMBRAL_DETENCION_MIN:
+            lat_m = gps.loc[ini_idx:fin_idx, lat].mean()
+            lon_m = gps.loc[ini_idx:fin_idx, lon].mean()
+            eventos.append([
+                ini, fin, round(mins, 2), lat_m, lon_m, aproximar_ubicacion(lat_m, lon_m)
+            ])
+
+    return pd.DataFrame(eventos, columns=[
+        "Inicio", "Fin", "Duración_min", "Lat", "Lon", "Ubicación_aprox"
+    ])
+
+# =========================
+# CIRCUITOS
+# =========================
+def etiquetar_base(dets, base):
+    if dets.empty or base is None:
+        dets["Es_base"] = False
+        return dets
+
+    flags = []
+    for _, r in dets.iterrows():
+        d = haversine_m(r["Lat"], r["Lon"], base["lat"], base["lon"])
+        flags.append(d is not None and d <= DISTANCIA_BASE_METROS)
+    dets = dets.copy()
+    dets["Es_base"] = flags
+    return dets
+
+def reconstruir_circuitos(gps, m, base):
+    fecha = m["fecha"]
+    lat = m["lat"]
+    lon = m["lon"]
+
+    if base is None:
+        return pd.DataFrame()
+
+    gps = gps.copy()
+    gps["_dist_base_m"] = gps.apply(
+        lambda r: haversine_m(r[lat], r[lon], base["lat"], base["lon"]) or 999999,
+        axis=1
+    )
+    gps["_en_base"] = gps["_dist_base_m"] <= DISTANCIA_BASE_METROS
+
+    circuitos = []
+    en_circuito = False
+    ini_idx = None
+    nro = 0
+
+    for i in range(1, len(gps)):
+        prev = bool(gps.loc[i - 1, "_en_base"])
+        act = bool(gps.loc[i, "_en_base"])
+
+        if prev and not act and not en_circuito:
+            en_circuito = True
+            ini_idx = i
+        elif not prev and act and en_circuito:
+            fin_idx = i
+            nro += 1
+            tramo = gps.loc[ini_idx:fin_idx].copy()
+            ini = tramo[fecha].min()
+            fin = tramo[fecha].max()
+            dur = (fin - ini).total_seconds() / 60
+            km = tramo["_dist_km"].sum()
+            dets = int((~tramo["_mov"]).sum())
+            zona = f"{round(tramo[lat].mean(), 5)}, {round(tramo[lon].mean(), 5)}"
+            circuitos.append([nro, ini, fin, round(dur, 2), round(km, 2), zona, dets])
+            en_circuito = False
+
+    return pd.DataFrame(circuitos, columns=[
+        "Circuito", "Inicio", "Fin", "Duración_min", "Km", "Zona_aprox", "Puntos_detenidos"
+    ])
+
+# =========================
+# COMBUSTIBLE
+# =========================
+def detectar_sensor_combustible(sens, sm):
+    col_sensor = sm["sensor"]
+    sensores = sens[col_sensor].dropna().unique().tolist()
+
+    preferidos = []
+    for s in sensores:
+        sn = norm(s)
+        if "fuel level" in sn or "nivel de combustible" in sn or "combustible" in sn:
+            preferidos.append(s)
+
+    if not preferidos:
+        return None
+
+    # priorizar nivel de combustible %
+    for p in preferidos:
+        pn = norm(p)
+        if "%" in pn or "level" in pn or "nivel" in pn:
+            return p
+
+    return preferidos[0]
+
+def detectar_eventos_combustible(sens, sm, gps, gm):
+    col_sensor = sm["sensor"]
+    col_fecha = sm["fecha"]
+    col_valor = sm["valor"]
+
+    sensor_comb = detectar_sensor_combustible(sens, sm)
+    if sensor_comb is None:
+        return pd.DataFrame(), None
+
+    df = sens[sens[col_sensor] == sensor_comb].copy().sort_values(col_fecha)
+    df["prev_valor"] = df[col_valor].shift(1)
+    df["prev_fecha"] = df[col_fecha].shift(1)
+    df["delta"] = df[col_valor] - df["prev_valor"]
+    df["delta_min"] = (df[col_fecha] - df["prev_fecha"]).dt.total_seconds() / 60
+
+    eventos = df[
+        df["delta"].abs() >= UMBRAL_CAMBIO_COMBUSTIBLE
+    ].copy()
+
+    if eventos.empty:
+        return pd.DataFrame(), sensor_comb
+
+    # cruzar con gps
+    gf = gm["fecha"]
+    glat = gm["lat"]
+    glon = gm["lon"]
+    gvel = gm["vel"]
+
+    gps_sorted = gps.sort_values(gf).copy()
+    eventos = eventos.sort_values(col_fecha).copy()
+
+    merge = pd.merge_asof(
+        eventos,
+        gps_sorted[[gf, glat, glon] + ([gvel] if gvel else [])].sort_values(gf),
+        left_on=col_fecha,
+        right_on=gf,
+        direction="nearest"
+    )
+
+    estado = []
+    clasif = []
+    for _, r in merge.iterrows():
+        vel = r[gvel] if gvel and gvel in merge.columns else None
+        detenido = False if vel is None or pd.isna(vel) else vel <= 3
+        estado.append("Detenido" if detenido else "En movimiento")
+
+        if r["delta"] > 0:
+            clasif.append("Carga de combustible")
+        elif r["delta"] < 0 and detenido:
+            clasif.append("Posible extracción")
+        else:
+            clasif.append("Descenso brusco")
+
+    merge["Ubicación_aprox"] = merge.apply(lambda r: aproximar_ubicacion(r.get(glat), r.get(glon)), axis=1)
+    merge["Estado_vehículo"] = estado
+    merge["Clasificación"] = clasif
+
+    out = merge[[
+        col_fecha, "prev_valor", col_valor, "delta", "Ubicación_aprox", "Estado_vehículo", "Clasificación"
+    ]].copy()
+
+    out.columns = [
+        "Fecha_hora", "Porcentaje_antes", "Porcentaje_después", "Variación",
+        "Ubicación_aprox", "Estado_vehículo", "Clasificación"
+    ]
+
+    return out, sensor_comb
+
+# =========================
+# CRUCE CIRCUITO / COMBUSTIBLE
+# =========================
+def asignar_circuito_a_evento(fecha_evento, circuitos):
+    if circuitos.empty:
+        return "Sin circuito identificado"
+    for _, r in circuitos.iterrows():
+        if r["Inicio"] <= fecha_evento <= r["Fin"]:
+            return f"Circuito {int(r['Circuito'])}"
+    return "Fuera de circuito"
+
+def clasificar_evento_combustible(row):
+    clasif = row.get("Clasificación", "")
+    estado = row.get("Estado_vehículo", "")
+    circuito = row.get("Circuito", "")
+
+    if "Carga" in clasif and estado == "Detenido":
+        return "Legítimo / operativo"
+    if "Posible extracción" in clasif and estado == "Detenido":
+        return "Sospechoso"
+    if "Descenso" in clasif and circuito == "Fuera de circuito":
+        return "Sospechoso"
+    return "Operativo"
+
+# =========================
+# PATRONES DE CONDUCCIÓN
+# =========================
+def detectar_patrones_chofer(gps, gm, circuitos):
+    gf = gm["fecha"]
+    gv = gm["vel"]
+
+    if gf not in gps.columns:
+        return "<p>No fue posible detectar patrones.</p>"
+
+    aux = gps.copy()
+    aux["hora"] = aux[gf].dt.hour
+
+    resumen = {}
+    resumen["Franja horaria predominante"] = franja_horaria(aux[gf].mode().iloc[0]) if not aux.empty else "-"
+    resumen["Velocidad promedio estimada"] = round(pd.to_numeric(aux[gv], errors="coerce").mean(), 2) if gv and gv in aux.columns else "No disponible"
+    resumen["Cantidad de circuitos"] = len(circuitos)
+    resumen["Duración promedio de circuitos"] = round(circuitos["Duración_min"].mean(), 2) if not circuitos.empty else "No disponible"
+
+    texto = """
+    <ul>
+    """
+    for k, v in resumen.items():
+        texto += f"<li><b>{escape(str(k))}:</b> {escape(str(v))}</li>"
+
+    texto += """
+    </ul>
+    <p>Interpretación: si se observan diferencias marcadas entre horarios, velocidades, duración de circuitos
+    y forma de operación, pueden existir indicios compatibles con distintos choferes o turnos operativos.</p>
+    """
+    return texto
+
+# =========================
+# DESVÍOS
+# =========================
+def detectar_desvios(gps, gm, base, circuitos):
+    if base is None or gps.empty:
+        return pd.DataFrame()
+
+    gf = gm["fecha"]
+    glat = gm["lat"]
+    glon = gm["lon"]
+
+    gps = gps.copy()
+    gps["_dist_base_m"] = gps.apply(
+        lambda r: haversine_m(r[glat], r[glon], base["lat"], base["lon"]) or 0,
+        axis=1
+    )
+
+    desv = gps[gps["_dist_base_m"] > DISTANCIA_DESVIO_METROS].copy()
+    if desv.empty:
+        return pd.DataFrame()
+
+    out = desv[[gf, glat, glon, "_dist_base_m"]].copy()
+    out["Ubicación_aprox"] = out.apply(lambda r: aproximar_ubicacion(r[glat], r[glon]), axis=1)
+    out["Circuito"] = out[gf].apply(lambda x: asignar_circuito_a_evento(x, circuitos))
+    out.rename(columns={
+        gf: "Fecha_hora",
+        "_dist_base_m": "Distancia_a_base_m"
+    }, inplace=True)
+
+    return out.head(50)
+
+# =========================
+# INFORME
 # =========================
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -401,7 +488,7 @@ def index():
             if "sensores" not in request.files or "historico" not in request.files:
                 return """
                 <h3>Error: faltan archivos</h3>
-                <p>Subí ambos archivos: sensores e histórico.</p>
+                <p>Subí ambos archivos: sensores e histórico GPS.</p>
                 <a href="/">Volver</a>
                 """
 
@@ -409,207 +496,152 @@ def index():
             historico = request.files["historico"]
 
             df_s_raw = leer_csv_flexible(sensores)
-            df_h_raw = leer_csv_flexible(historico)
+            df_g_raw = leer_csv_flexible(historico)
 
-            df_s, col_sensor, col_fecha_s, col_valor = preparar_sensores(df_s_raw)
-            tabla = pivotear_sensores(df_s, col_sensor, col_fecha_s, col_valor)
+            sens, sm = preparar_sensores(df_s_raw)
+            gps, gm = preparar_gps(df_g_raw)
 
-            df_h, col_fecha_h, col_lat, col_lon, col_vel_h = preparar_historico(df_h_raw)
+            # Resumen GPS
+            gf = gm["fecha"]
+            gv = gm["vel"]
+            total_km = round(gps["_dist_km"].sum(), 2)
+            vel_max = round(pd.to_numeric(gps[gv], errors="coerce").max(), 2) if gv and gv in gps.columns else "No disponible"
+            tiempo_mov = round((gps[gps["_mov"]][gf].max() - gps[gps["_mov"]][gf].min()).total_seconds() / 60, 2) if gps["_mov"].any() else 0
 
-            claves = detectar_columnas_clave(tabla)
-            col_fecha = claves["fecha"]
-            col_combustible_total = claves["combustible_total"]
-            col_vel = claves["velocidad"] or col_vel_h
-            col_rpm = claves["rpm"]
-            col_temp = claves["temperatura"]
-            col_pedal = claves["pedal"]
-            col_freno = claves["freno_brusco"]
-            col_motor = claves["motor"]
+            detenciones = detectar_detenciones(gps, gm)
+            base, dets = detectar_base_operativa(gps, gm)
+            dets = etiquetar_base(dets, base)
 
-            # Si el histórico tiene velocidad, la fusionamos por fecha aproximada cuando falta en sensores
-            base = tabla.copy()
+            tiempo_det = round(dets["Duración_min"].sum(), 2) if not dets.empty else 0
+            circuitos = reconstruir_circuitos(gps, gm, base)
 
-            if col_vel is None and col_vel_h and col_fecha_h:
-                base = pd.merge_asof(
-                    base.sort_values(col_fecha),
-                    df_h[[col_fecha_h, col_vel_h]].sort_values(col_fecha_h),
-                    left_on=col_fecha,
-                    right_on=col_fecha_h,
-                    direction="nearest"
+            # Combustible
+            eventos_comb, sensor_comb = detectar_eventos_combustible(sens, sm, gps, gm)
+            consumo_total = "No disponible"
+            if sensor_comb is not None and not eventos_comb.empty:
+                descensos = eventos_comb[eventos_comb["Variación"] < 0]["Variación"].abs().sum()
+                consumo_total = round(float(descensos), 2)
+
+            # Cruce combustible / circuito
+            if not eventos_comb.empty:
+                eventos_comb = eventos_comb.copy()
+                eventos_comb["Circuito"] = eventos_comb["Fecha_hora"].apply(lambda x: asignar_circuito_a_evento(x, circuitos))
+                eventos_comb["Evaluación"] = eventos_comb.apply(clasificar_evento_combustible, axis=1)
+
+            # Detenciones fuera de base
+            det_fuera = dets[dets["Es_base"] == False].copy() if not dets.empty else pd.DataFrame()
+            if not det_fuera.empty:
+                det_fuera["Interpretación_operativa"] = det_fuera["Duración_min"].apply(
+                    lambda x: "Detención operativa breve" if x <= 15 else "Detención prolongada / revisar actividad"
                 )
-                col_vel = col_vel_h
 
-            fecha_ini = base[col_fecha].min() if col_fecha in base.columns else pd.NaT
-            fecha_fin = base[col_fecha].max() if col_fecha in base.columns else pd.NaT
-            duracion_horas = round((fecha_fin - fecha_ini).total_seconds() / 3600, 2) if pd.notna(fecha_ini) and pd.notna(fecha_fin) else pd.NA
+            # Desvíos
+            desvios = detectar_desvios(gps, gm, base, circuitos)
 
-            distancia = calcular_distancia(df_h, col_lat, col_lon)
-            consumo = consumo_total(base, col_combustible_total)
+            # Consumo por circuito
+            consumo_circuito_rows = []
+            if not circuitos.empty and not eventos_comb.empty:
+                for _, c in circuitos.iterrows():
+                    ev = eventos_comb[
+                        (eventos_comb["Fecha_hora"] >= c["Inicio"]) &
+                        (eventos_comb["Fecha_hora"] <= c["Fin"])
+                    ]
+                    desc = ev[ev["Variación"] < 0]["Variación"].abs().sum()
+                    km = c["Km"]
+                    ef = round(desc / km, 2) if km and km > 0 else pd.NA
+                    consumo_circuito_rows.append([
+                        int(c["Circuito"]), round(float(desc), 2), km, ef
+                    ])
 
-            if pd.notna(consumo) and pd.notna(distancia) and distancia not in [0, pd.NA]:
-                consumo_l100 = round((consumo / float(distancia)) * 100, 2)
-            else:
-                consumo_l100 = pd.NA
+            consumo_circuito = pd.DataFrame(consumo_circuito_rows, columns=[
+                "Circuito", "Combustible_consumido_aprox", "Km", "Eficiencia_estimativa"
+            ])
 
-            acel80, acel90 = detectar_aceleraciones(base, col_fecha, col_pedal)
-            excesos, vmax, hora_vmax = detectar_exceso_velocidad(base, col_fecha, col_vel)
-            ralenti_df, tiempo_ralenti = detectar_ralenti(base, col_fecha, col_vel, col_motor)
-            frenadas = detectar_frenadas(base, col_fecha, col_freno)
-
-            alertas_mec = detectar_alertas_mecanicas(base, col_vel, col_rpm, col_temp, col_pedal)
-            cant_alertas_mec = sum(1 for a in alertas_mec if not str(a).startswith("⚠"))
-
-            cant_ralenti_15 = int((ralenti_df["Minutos"] > RALENTI_MINUTOS_PENALIZA).sum()) if not ralenti_df.empty else 0
-            score = score_final(
-                score=100,
-                cant_acel_80=len(acel80),
-                cant_acel_90=len(acel90),
-                cant_ralenti_15=cant_ralenti_15,
-                cant_excesos_vel=len(excesos),
-                consumo_l100=consumo_l100
-            )
-
-            riesgo = nivel_riesgo(score)
-            interpretacion = interpretar_score(score)
-            estado_veh = estado_mecanico(cant_alertas_mec)
-
-            sensores_detectados = sorted(df_s[col_sensor].dropna().unique().tolist())
-
-            # Tablas resumidas
-            tabla_acel80 = acel80[[col_fecha, col_pedal]].copy() if not acel80.empty else pd.DataFrame(columns=["Sin datos"])
-            if not acel80.empty:
-                tabla_acel80["Clasificación"] = acel80[col_pedal].apply(clasificar_agresividad)
-
-            tabla_excesos = excesos[[col_fecha, col_vel]].copy() if not excesos.empty else pd.DataFrame(columns=["Sin datos"])
-            tabla_frenadas = frenadas[[col_fecha, col_freno]].copy() if not frenadas.empty else pd.DataFrame(columns=["Sin datos"])
-
-            mayor_agresividad = horas_con_mas_eventos(acel80, col_fecha)
-            mayor_velocidad = hora_vmax
-            mayor_ralenti = "-"
-            if not ralenti_df.empty:
-                fila = ralenti_df.loc[ralenti_df["Minutos"].idxmax()]
-                mayor_ralenti = f"{formatear_hora(fila['Inicio'])} a {formatear_hora(fila['Fin'])}"
-
-            recomendacion = []
-            if riesgo == "Alto":
-                recomendacion.append("Implementar seguimiento inmediato del conductor y revisión de hábitos de manejo.")
-            if estado_veh != "Normal":
-                recomendacion.append("Programar inspección mecánica preventiva y validación de sensores.")
-            if pd.notna(consumo_l100) and pd.notna(CONSUMO_ESPERADO_L100) and pd.notna(consumo_l100) and consumo_l100 > CONSUMO_ESPERADO_L100 * 1.2:
-                recomendacion.append("Revisar consumo anormal, ralentí prolongado y posibles pérdidas o desvíos.")
-            if not recomendacion:
-                recomendacion.append("Operación dentro de parámetros razonables, mantener monitoreo continuo.")
+            patrones_html = detectar_patrones_chofer(gps, gm, circuitos)
 
             html = f"""
             <html>
             <head>
                 <meta charset="utf-8">
-                <title>Auditoría Técnica Vehicular</title>
+                <title>Informe de Auditoría de Flota</title>
                 <style>
                     body {{ font-family: Arial, sans-serif; margin: 24px; }}
-                    h1, h2, h3 {{ color: #1f3b5b; }}
+                    h1, h2 {{ color: #18324a; }}
                     table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
                     th, td {{ border: 1px solid #ccc; padding: 8px; text-align: left; }}
-                    th {{ background: #f1f1f1; }}
-                    .ok {{ color: green; }}
-                    .warn {{ color: #b26a00; }}
-                    .crit {{ color: red; }}
-                    .box {{ padding: 12px; border: 1px solid #ddd; margin-bottom: 18px; background: #fafafa; }}
+                    th {{ background: #f0f0f0; }}
+                    .box {{ border: 1px solid #ddd; padding: 14px; margin-bottom: 20px; background: #fafafa; }}
                 </style>
             </head>
             <body>
-                <h1>Auditoría Técnica de Telemetría Vehicular</h1>
+                <h1>Informe Técnico de Auditoría de Flota</h1>
 
                 <div class="box">
-                    <h2>1) Resumen Ejecutivo</h2>
-                    <p><b>Fecha analizada:</b> {formatear_hora(fecha_ini)} a {formatear_hora(fecha_fin)}</p>
-                    <p><b>Duración del registro:</b> {duracion_horas if pd.notna(duracion_horas) else "No disponible"} horas</p>
-                    <p><b>Distancia recorrida:</b> {distancia if pd.notna(distancia) else "No disponible"}</p>
-                    <p><b>Consumo total de combustible:</b> {consumo if pd.notna(consumo) else "No disponible"}</p>
-                    <p><b>Promedio de consumo (L/100km):</b> {consumo_l100 if pd.notna(consumo_l100) else "No disponible"}</p>
-                    <p><b>Score general del conductor:</b> {score}/100</p>
-                    <p><b>Interpretación:</b> {interpretacion}</p>
+                    <h2>1. Resumen Ejecutivo</h2>
+                    <p><b>Período analizado:</b> {fmt_fecha(gps[gf].min())} a {fmt_fecha(gps[gf].max())}</p>
+                    <p><b>Distancia total recorrida:</b> {total_km} km</p>
+                    <p><b>Cantidad de detenciones:</b> {len(dets)}</p>
+                    <p><b>Velocidad máxima:</b> {vel_max}</p>
+                    <p><b>Tiempo en movimiento:</b> {tiempo_mov} min</p>
+                    <p><b>Tiempo detenido:</b> {tiempo_det} min</p>
+                    <p><b>Consumo total de combustible:</b> {consumo_total}</p>
                 </div>
 
                 <div class="box">
-                    <h2>2) Análisis de conducta del chofer</h2>
-                    <p><b>Aceleraciones bruscas &gt;80%:</b> {len(acel80)}</p>
-                    <p><b>Aceleraciones &gt;90%:</b> {len(acel90)}</p>
-                    <p><b>Franja horaria con mayor concentración:</b> {mayor_agresividad}</p>
-                    {html_tabla(tabla_acel80, index=False)}
-
-                    <p><b>Velocidad máxima del día:</b> {vmax if pd.notna(vmax) else "No disponible"}</p>
-                    <p><b>Horario exacto:</b> {hora_vmax}</p>
-                    <p><b>Cantidad de eventos por encima del límite:</b> {len(excesos)}</p>
-                    {html_tabla(tabla_excesos, index=False)}
-
-                    <p><b>Tiempo total en ralentí:</b> {tiempo_ralenti} minutos</p>
-                    <p><b>Bloque más prolongado:</b> {mayor_ralenti}</p>
-                    <p><b>Cantidad de eventos &gt;10 minutos:</b> {int((ralenti_df['Minutos'] > 10).sum()) if not ralenti_df.empty else 0}</p>
-                    {html_tabla(ralenti_df, index=False)}
-
-                    <p><b>Frenadas bruscas:</b> {len(frenadas)}</p>
-                    {html_tabla(tabla_frenadas, index=False)}
+                    <h2>2. Identificación de base operativa</h2>
+                    {f"<p><b>Base operativa detectada:</b> {escape(base['ubicacion'])}</p><p><b>Detención más extensa:</b> {round(base['duracion_min'],2)} min</p>" if base else "<p>No fue posible identificar base operativa.</p>"}
                 </div>
 
                 <div class="box">
-                    <h2>3) Análisis de consumo y eficiencia</h2>
-                    <p><b>Combustible consumido total:</b> {consumo if pd.notna(consumo) else "No disponible"}</p>
-                    <p><b>Consumo promedio L/100km:</b> {consumo_l100 if pd.notna(consumo_l100) else "No disponible"}</p>
-                    <p><b>Relación consumo vs distancia:</b> {"Disponible" if pd.notna(consumo) and pd.notna(distancia) else "Incompleta por falta de datos"}</p>
-                    <p><b>Posibles anomalías:</b></p>
+                    <h2>3. Circuitos de trabajo</h2>
+                    {html_tabla(circuitos, index=False)}
+                </div>
+
+                <div class="box">
+                    <h2>4. Análisis de detenciones</h2>
+                    {html_tabla(det_fuera[["Inicio","Fin","Duración_min","Ubicación_aprox","Interpretación_operativa"]], index=False) if not det_fuera.empty else "<p>No se detectaron detenciones fuera de base relevantes.</p>"}
+                </div>
+
+                <div class="box">
+                    <h2>5. Detección de desvíos</h2>
+                    {html_tabla(desvios[["Fecha_hora","Distancia_a_base_m","Ubicación_aprox","Circuito"]], index=False) if not desvios.empty else "<p>No se detectaron desvíos relevantes con esta configuración base.</p>"}
+                </div>
+
+                <div class="box">
+                    <h2>6. Auditoría de combustible</h2>
+                    <p><b>Sensor utilizado:</b> {escape(str(sensor_comb)) if sensor_comb else "No detectado"}</p>
+                    {html_tabla(eventos_comb, index=False) if not eventos_comb.empty else "<p>No se detectaron eventos de combustible mayores al 5% o no se identificó sensor válido.</p>"}
+                </div>
+
+                <div class="box">
+                    <h2>7. Cruce entre combustible y recorrido</h2>
+                    {html_tabla(eventos_comb[["Fecha_hora","Ubicación_aprox","Circuito","Estado_vehículo","Clasificación","Evaluación"]], index=False) if not eventos_comb.empty else "<p>Sin eventos para cruzar.</p>"}
+                </div>
+
+                <div class="box">
+                    <h2>8. Consumo por circuito</h2>
+                    {html_tabla(consumo_circuito, index=False) if not consumo_circuito.empty else "<p>No fue posible estimar consumo por circuito con los datos actuales.</p>"}
+                </div>
+
+                <div class="box">
+                    <h2>9. Patrones de conducción</h2>
+                    {patrones_html}
+                </div>
+
+                <div class="box">
+                    <h2>10. Conclusión de auditoría</h2>
                     <ul>
-                        <li>{"Consumo elevado respecto del esperado" if pd.notna(consumo_l100) and consumo_l100 > CONSUMO_ESPERADO_L100 * 1.2 else "Sin anomalía crítica evidente por consumo promedio"}</li>
-                        <li>{"Se detectó ralentí prolongado" if tiempo_ralenti > 0 else "No se detectó ralentí significativo"}</li>
+                        <li><b>Consistencia del comportamiento del vehículo:</b> {"Consistente" if len(desvios) == 0 else "Con observaciones por posibles desvíos"}</li>
+                        <li><b>Anomalías operativas:</b> {"No se detectan anomalías críticas en esta corrida base." if det_fuera.empty else "Se detectan detenciones fuera de base que requieren revisión."}</li>
+                        <li><b>Posibles desvíos:</b> {"No evidentes" if desvios.empty else f"Se detectaron {len(desvios)} puntos a distancia relevante de la base."}</li>
+                        <li><b>Indicios de manipulación o robo de combustible:</b> {"No concluyentes" if eventos_comb.empty else "Revisar eventos clasificados como sospechosos."}</li>
                     </ul>
-                </div>
-
-                <div class="box">
-                    <h2>4) Estado del vehículo</h2>
-                    <ul>
-                        {''.join(f"<li>{escape(str(a))}</li>" for a in alertas_mec)}
-                    </ul>
-                </div>
-
-                <div class="box">
-                    <h2>5) Franjas horarias críticas</h2>
-                    <p><b>Horario con mayor agresividad de conducción:</b> {mayor_agresividad}</p>
-                    <p><b>Horario con mayor consumo:</b> No disponible en esta versión base</p>
-                    <p><b>Horario con mayor velocidad:</b> {mayor_velocidad}</p>
-                    <p><b>Horario con mayor tiempo en ralentí:</b> {mayor_ralenti}</p>
-                </div>
-
-                <div class="box">
-                    <h2>6) Clasificación final</h2>
-                    <p><b>Nivel de riesgo del conductor:</b> {riesgo}</p>
-                    <p><b>Estado mecánico:</b> {estado_veh}</p>
-                    <p><b>Recomendación operativa concreta:</b></p>
-                    <ul>
-                        {''.join(f"<li>{escape(r)}</li>" for r in recomendacion)}
-                    </ul>
-                </div>
-
-                <div class="box">
-                    <h2>7) Alertas automáticas sugeridas</h2>
-                    <ul>
-                        <li>Aceleración brusca</li>
-                        <li>Exceso de velocidad</li>
-                        <li>Ralentí prolongado</li>
-                        <li>Consumo anormal</li>
-                        <li>Falla de sensor</li>
-                    </ul>
-                </div>
-
-                <div class="box">
-                    <h2>Sensores detectados</h2>
-                    <pre>{escape(str(sensores_detectados))}</pre>
                 </div>
 
                 <p><a href="/">Volver</a></p>
             </body>
             </html>
             """
-
             return html
 
         except Exception as e:
@@ -623,23 +655,22 @@ def index():
     <html>
     <head>
         <meta charset="utf-8">
-        <title>Auditoría de telemetría</title>
+        <title>Auditoría técnica de flota</title>
     </head>
     <body style="font-family: Arial; margin: 24px;">
-        <h2>Auditoría de telemetría vehicular</h2>
+        <h2>Auditoría técnica completa de flota</h2>
         <form method="post" enctype="multipart/form-data">
-            <label>Archivo sensores:</label><br>
+            <label>Archivo de sensores:</label><br>
             <input type="file" name="sensores"><br><br>
 
-            <label>Archivo histórico:</label><br>
+            <label>Archivo histórico GPS:</label><br>
             <input type="file" name="historico"><br><br>
 
-            <input type="submit" value="Analizar">
+            <input type="submit" value="Generar auditoría">
         </form>
     </body>
     </html>
     '''
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

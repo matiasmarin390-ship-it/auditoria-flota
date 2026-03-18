@@ -1,21 +1,26 @@
 from flask import Flask, request
 import pandas as pd
+import io
 
 app = Flask(__name__)
 
 def leer_csv_flexible(archivo):
-    separadores = [",", ";"]
-    codificaciones = ["utf-8", "latin1", "cp1252"]
+    separadores = [",", ";", "\t"]
+    codificaciones = ["utf-8", "utf-8-sig", "cp1252", "latin1", "iso-8859-1"]
 
+    contenido_bytes = archivo.read()
     ultimo_error = None
 
     for enc in codificaciones:
-        for sep in separadores:
-            try:
-                archivo.seek(0)
-                return pd.read_csv(archivo, sep=sep, encoding=enc)
-            except Exception as e:
-                ultimo_error = e
+        try:
+            texto = contenido_bytes.decode(enc)
+            for sep in separadores:
+                try:
+                    return pd.read_csv(io.StringIO(texto), sep=sep)
+                except Exception as e:
+                    ultimo_error = e
+        except Exception as e:
+            ultimo_error = e
 
     raise ultimo_error
 
@@ -50,7 +55,7 @@ def index():
                 <a href="/">Volver</a>
                 """
 
-            df_s["delta"] = df_s["can fuel level 1%"].diff()
+            df_s["delta"] = pd.to_numeric(df_s["can fuel level 1%"], errors="coerce").diff()
             eventos = df_s[df_s["delta"].abs() > 10]
 
             return f"""

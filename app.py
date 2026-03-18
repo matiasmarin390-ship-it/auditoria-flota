@@ -5,24 +5,41 @@ import io
 app = Flask(__name__)
 
 def leer_csv_flexible(archivo):
-    separadores = [",", ";", "\t"]
+    separadores = [",", ";", "\t", "|"]
     codificaciones = ["utf-8", "utf-8-sig", "cp1252", "latin1", "iso-8859-1"]
 
     contenido_bytes = archivo.read()
-    ultimo_error = None
+    mejor_df = None
 
     for enc in codificaciones:
         try:
-            texto = contenido_bytes.decode(enc)
-            for sep in separadores:
-                try:
-                    return pd.read_csv(io.StringIO(texto), sep=sep)
-                except Exception as e:
-                    ultimo_error = e
-        except Exception as e:
-            ultimo_error = e
+            texto = contenido_bytes.decode(enc, errors="replace")
+        except Exception:
+            continue
 
-    raise ultimo_error
+        for sep in separadores:
+            try:
+                df = pd.read_csv(
+                    io.StringIO(texto),
+                    sep=sep,
+                    engine="python",
+                    on_bad_lines="skip"
+                )
+
+                # Nos quedamos con la opción que más columnas útiles tenga
+                if df is not None and len(df.columns) > 1:
+                    return df
+
+                if mejor_df is None or len(df.columns) > len(mejor_df.columns):
+                    mejor_df = df
+
+            except Exception:
+                continue
+
+    if mejor_df is not None:
+        return mejor_df
+
+    raise Exception("No se pudo interpretar el archivo CSV con ningún separador/codificación.")
 
 @app.route("/", methods=["GET", "POST"])
 def index():
@@ -47,15 +64,23 @@ def index():
             df_s = leer_csv_flexible(sensores)
             df_h = leer_csv_flexible(historico)
 
-            if "can fuel level 1%" not in df_s.columns:
+            columna_comb = None
+            for col in df_s.columns:
+                if str(col).strip().lower() == "can fuel level 1%":
+                    columna_comb = col
+                    break
+
+            if columna_comb is None:
                 return f"""
                 <h3>Error: no encuentro la columna 'can fuel level 1%'</h3>
                 <p>Columnas detectadas en sensores:</p>
                 <pre>{list(df_s.columns)}</pre>
+                <h4>Primeras filas del archivo sensores:</h4>
+                {df_s.head(5).to_html()}
                 <a href="/">Volver</a>
                 """
 
-            df_s["delta"] = pd.to_numeric(df_s["can fuel level 1%"], errors="coerce").diff()
+            df_s["delta"] = pd.to_numeric(df_s[columna_comb], errors="coerce").diff()
             eventos = df_s[df_s["delta"].abs() > 10]
 
             return f"""
@@ -63,7 +88,13 @@ def index():
             <p>Registros sensores: {len(df_s)}</p>
             <p>Registros histórico: {len(df_h)}</p>
             <p>Eventos detectados: {len(eventos)}</p>
+
+            <h3>Columnas detectadas en sensores</h3>
+            <pre>{list(df_s.columns)}</pre>
+
+            <h3>Eventos detectados</h3>
             {eventos.to_html()}
+
             <br><a href="/">Volver</a>
             """
 

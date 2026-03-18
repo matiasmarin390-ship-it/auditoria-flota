@@ -26,7 +26,6 @@ def leer_csv_flexible(archivo):
                     on_bad_lines="skip"
                 )
 
-                # Nos quedamos con la opción que más columnas útiles tenga
                 if df is not None and len(df.columns) > 1:
                     return df
 
@@ -64,36 +63,57 @@ def index():
             df_s = leer_csv_flexible(sensores)
             df_h = leer_csv_flexible(historico)
 
-            columna_comb = None
-            for col in df_s.columns:
-                if str(col).strip().lower() == "can fuel level 1%":
-                    columna_comb = col
-                    break
+            columnas_necesarias = ["Sensor", "Fecha", "Valor"]
+            for col in columnas_necesarias:
+                if col not in df_s.columns:
+                    return f"""
+                    <h3>Error: no encuentro la columna '{col}' en sensores</h3>
+                    <p>Columnas detectadas:</p>
+                    <pre>{list(df_s.columns)}</pre>
+                    <a href="/">Volver</a>
+                    """
 
-            if columna_comb is None:
+            # Normalización
+            df_s["Sensor"] = df_s["Sensor"].astype(str).str.strip()
+            df_s["Fecha"] = pd.to_datetime(df_s["Fecha"], errors="coerce")
+            df_s["Valor"] = pd.to_numeric(df_s["Valor"], errors="coerce")
+
+            # Buscar sensores relacionados con combustible
+            sensores_combustible = df_s[
+                df_s["Sensor"].str.lower().str.contains("combustible|fuel", na=False)
+            ].copy()
+
+            if sensores_combustible.empty:
+                sensores_unicos = sorted(df_s["Sensor"].dropna().unique().tolist())
                 return f"""
-                <h3>Error: no encuentro la columna 'can fuel level 1%'</h3>
-                <p>Columnas detectadas en sensores:</p>
-                <pre>{list(df_s.columns)}</pre>
-                <h4>Primeras filas del archivo sensores:</h4>
-                {df_s.head(5).to_html()}
+                <h3>Error: no encontré sensores de combustible</h3>
+                <p>Sensores detectados:</p>
+                <pre>{sensores_unicos}</pre>
                 <a href="/">Volver</a>
                 """
 
-            df_s["delta"] = pd.to_numeric(df_s[columna_comb], errors="coerce").diff()
-            eventos = df_s[df_s["delta"].abs() > 10]
+            # Elegimos el sensor con más registros
+            sensor_objetivo = sensores_combustible["Sensor"].value_counts().idxmax()
+
+            df_comb = df_s[df_s["Sensor"] == sensor_objetivo].copy()
+            df_comb = df_comb.sort_values("Fecha")
+            df_comb["delta"] = df_comb["Valor"].diff()
+
+            eventos = df_comb[df_comb["delta"].abs() > 10].copy()
 
             return f"""
             <h2>Auditoría de telemetría</h2>
+            <p><b>Sensor analizado:</b> {sensor_objetivo}</p>
             <p>Registros sensores: {len(df_s)}</p>
             <p>Registros histórico: {len(df_h)}</p>
+            <p>Registros del sensor analizado: {len(df_comb)}</p>
             <p>Eventos detectados: {len(eventos)}</p>
 
-            <h3>Columnas detectadas en sensores</h3>
-            <pre>{list(df_s.columns)}</pre>
+            <h3>Sensores de combustible detectados</h3>
+            <pre>{sorted(sensores_combustible["Sensor"].unique().tolist())}</pre>
 
             <h3>Eventos detectados</h3>
-            {eventos.to_html()}
+            {eventos[["Fecha", "Sensor", "Valor", "delta"]].to_html(index=False)}
 
             <br><a href="/">Volver</a>
             """

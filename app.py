@@ -97,6 +97,15 @@ def fmt_fecha(x):
     return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def fmt_duracion_min(mins):
+    if mins is None or pd.isna(mins):
+        return "No disponible"
+    mins = int(round(float(mins)))
+    h = mins // 60
+    m = mins % 60
+    return f"{h} h {m} min"
+
+
 def html_tabla(df, index=False):
     if df is None or df.empty:
         return "<p>Sin datos.</p>"
@@ -181,10 +190,6 @@ def maps_route_url(points_df):
 
 
 def extraer_localidad_barrio_desde_texto(texto):
-    """
-    Intenta sacar barrio/localidad desde una dirección del archivo.
-    No inventa datos. Si no puede, devuelve 'no disponible'.
-    """
     if pd.isna(texto):
         return {"localidad": "Localidad no disponible", "barrio": "Barrio no disponible"}
 
@@ -192,7 +197,6 @@ def extraer_localidad_barrio_desde_texto(texto):
     if not t:
         return {"localidad": "Localidad no disponible", "barrio": "Barrio no disponible"}
 
-    # Heurística simple: separar por coma
     partes = [p.strip() for p in t.split(",") if p.strip()]
 
     barrio = "Barrio no disponible"
@@ -281,8 +285,7 @@ def preparar_gps(df):
     return gps, {
         "fecha": col_fecha,
         "vel": col_vel,
-        "odo": col_odo,
-        "ubi": col_ubi
+        "odo": col_odo
     }
 
 
@@ -389,6 +392,7 @@ def detectar_detenciones(gps, gm):
     ])
 
     if not df.empty:
+        df["Duración"] = df["Duración_min"].apply(fmt_duracion_min)
         df["Google_Maps"] = df["Google_Maps"].apply(
             lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
         )
@@ -469,20 +473,17 @@ def reconstruir_circuitos(gps, gm, base):
 
             ini = tramo[fecha].min()
             fin = tramo[fecha].max()
-            dur = (fin - ini).total_seconds() / 60
+            dur_min = (fin - ini).total_seconds() / 60
             km = round(tramo["_dist_km"].sum(), 2)
 
             lat_prom = tramo["_lat"].mean()
             lon_prom = tramo["_lon"].mean()
 
-            # Centro del circuito: sacar localidad/barrio desde direcciones del tramo
             texto_dir = tramo["_direccion_raw"].dropna().astype(str)
             dir_ref = texto_dir.mode().iloc[0] if not texto_dir.empty else ""
             geo_centro = extraer_localidad_barrio_desde_texto(dir_ref)
-
             punto_central = texto_ubicacion(geo_centro["localidad"], geo_centro["barrio"])
 
-            # Inicio y final
             dir_ini = str(tramo.iloc[0]["_direccion_raw"]) if pd.notna(tramo.iloc[0]["_direccion_raw"]) else ""
             dir_fin = str(tramo.iloc[-1]["_direccion_raw"]) if pd.notna(tramo.iloc[-1]["_direccion_raw"]) else ""
 
@@ -493,6 +494,8 @@ def reconstruir_circuitos(gps, gm, base):
             punto_final = texto_ubicacion(geo_fin["localidad"], geo_fin["barrio"])
 
             maps_circuito = maps_route_url(tramo)
+            maps_inicio = maps_pin_url(tramo.iloc[0]["_lat"], tramo.iloc[0]["_lon"])
+            maps_final = maps_pin_url(tramo.iloc[-1]["_lat"], tramo.iloc[-1]["_lon"])
 
             vel_prom = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").mean(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
             vel_max = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").max(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
@@ -502,12 +505,15 @@ def reconstruir_circuitos(gps, gm, base):
                 nro,
                 ini,
                 fin,
-                round(dur, 2),
+                round(dur_min, 2),
+                fmt_duracion_min(dur_min),
                 km,
                 punto_central,
                 punto_inicio,
                 punto_final,
                 maps_circuito,
+                maps_inicio,
+                maps_final,
                 vel_prom,
                 vel_max,
                 hora_salida,
@@ -522,11 +528,14 @@ def reconstruir_circuitos(gps, gm, base):
         "Inicio",
         "Fin",
         "Duración_min",
+        "Duración",
         "Km",
         "Punto_central",
         "Punto_inicio",
         "Punto_final",
         "Google_Maps_Recorrido",
+        "Google_Maps_Inicio",
+        "Google_Maps_Final",
         "Velocidad_promedio",
         "Velocidad_máxima",
         "Hora_salida",
@@ -537,6 +546,12 @@ def reconstruir_circuitos(gps, gm, base):
     if not df.empty:
         df["Google_Maps_Recorrido"] = df["Google_Maps_Recorrido"].apply(
             lambda x: f'<a href="{x}" target="_blank">Ver recorrido</a>' if x else ""
+        )
+        df["Google_Maps_Inicio"] = df["Google_Maps_Inicio"].apply(
+            lambda x: f'<a href="{x}" target="_blank">Ver inicio</a>' if x else ""
+        )
+        df["Google_Maps_Final"] = df["Google_Maps_Final"].apply(
+            lambda x: f'<a href="{x}" target="_blank">Ver final</a>' if x else ""
         )
 
     return df
@@ -593,26 +608,22 @@ def clasificar_circuitos(circuitos):
 def detectar_sensor_combustible(sens, sm):
     col_sensor = sm["sensor"]
 
-    exactos = sens[sens[col_sensor].astype(str).str.strip().str.lower() == "nivel de combustible (%)".lower()]
-    if not exactos.empty:
-        return "Nivel de combustible (%)"
+    # prioridad por nombre contenido
+    candidatos = sens[
+        sens[col_sensor].astype(str).str.lower().str.contains("nivel de combustible", na=False)
+    ][col_sensor].dropna().unique().tolist()
 
-    sensores = sens[col_sensor].dropna().unique().tolist()
-    candidatos = []
-    for s in sensores:
-        sn = norm(s)
-        if "nivel de combustible" in sn or "fuel level" in sn or "combustible" in sn:
-            candidatos.append(s)
+    if candidatos:
+        for c in candidatos:
+            if norm(c) == "nivel de combustible (%)":
+                return c
+        return candidatos[0]
 
-    if not candidatos:
-        return None
+    fallback = sens[
+        sens[col_sensor].astype(str).str.lower().str.contains("combustible", na=False)
+    ][col_sensor].dropna().unique().tolist()
 
-    for c in candidatos:
-        cn = norm(c)
-        if "nivel de combustible" in cn or "%" in cn or "level" in cn:
-            return c
-
-    return candidatos[0]
+    return fallback[0] if fallback else None
 
 
 def detectar_eventos_combustible(sens, sm, gps, gm):
@@ -622,62 +633,62 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
 
     sensor_comb = detectar_sensor_combustible(sens, sm)
     if sensor_comb is None:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, pd.DataFrame()
 
-    df = sens[sens[col_sensor].astype(str).str.strip() == str(sensor_comb)].copy().sort_values(col_fecha)
-    df["prev_valor"] = df[col_valor].shift(1)
-    df["delta"] = df[col_valor] - df["prev_valor"]
-
-    eventos = df[df["delta"].abs() >= UMBRAL_CAMBIO_COMBUSTIBLE].copy()
-    if eventos.empty:
-        return pd.DataFrame(), sensor_comb
+    serie = sens[sens[col_sensor].astype(str).str.strip() == str(sensor_comb)].copy().sort_values(col_fecha)
+    serie["prev_valor"] = serie[col_valor].shift(1)
+    serie["delta"] = serie[col_valor] - serie["prev_valor"]
 
     gf = gm["fecha"]
     gv = gm["vel"]
 
     gps_sorted = gps.sort_values(gf).copy()
-    eventos = eventos.sort_values(col_fecha).copy()
+    serie = serie.sort_values(col_fecha).copy()
 
-    merge = pd.merge_asof(
-        eventos,
+    serie_merge = pd.merge_asof(
+        serie,
         gps_sorted[[gf, "_lat", "_lon", "_direccion_raw"] + ([gv] if gv else [])].sort_values(gf),
         left_on=col_fecha,
         right_on=gf,
         direction="nearest"
     )
 
+    eventos = serie_merge[serie_merge["delta"].abs() >= UMBRAL_CAMBIO_COMBUSTIBLE].copy()
+    if eventos.empty:
+        return pd.DataFrame(), sensor_comb, serie_merge
+
     estados = []
     clasifs = []
     ubicaciones = []
 
-    for _, r in merge.iterrows():
-        vel = r[gv] if gv and gv in merge.columns else None
+    for _, r in eventos.iterrows():
+        vel = r[gv] if gv and gv in eventos.columns else None
         detenido = False if vel is None or pd.isna(vel) else vel <= VELOCIDAD_MOVIMIENTO
         estados.append("Detenido" if detenido else "En movimiento")
 
         if r["delta"] > 0:
             clasifs.append("Carga de combustible")
         elif r["delta"] < 0 and detenido:
-            clasifs.append("Posible extracción")
+            clasifs.append("Posible robo / extracción")
         else:
-            clasifs.append("Descenso brusco")
+            clasifs.append("Consumo / descenso brusco")
 
         geo = extraer_localidad_barrio_desde_texto(r["_direccion_raw"])
         ubicaciones.append(texto_ubicacion(geo["localidad"], geo["barrio"]))
 
-    merge["Ubicación"] = ubicaciones
-    merge["Google_Maps"] = merge.apply(lambda r: maps_pin_url(r["_lat"], r["_lon"]), axis=1)
-    merge["Estado_vehículo"] = estados
-    merge["Clasificación"] = clasifs
+    eventos["Ubicación"] = ubicaciones
+    eventos["Google_Maps"] = eventos.apply(lambda r: maps_pin_url(r["_lat"], r["_lon"]), axis=1)
+    eventos["Estado_vehículo"] = estados
+    eventos["Clasificación"] = clasifs
 
-    out = merge[[
+    out = eventos[[
         col_fecha, "prev_valor", col_valor, "delta",
         "Ubicación", "Google_Maps",
         "Estado_vehículo", "Clasificación"
     ]].copy()
 
     out.columns = [
-        "Fecha_hora", "Porcentaje_antes", "Porcentaje_después", "Variación",
+        "Fecha_hora", "Nivel_antes", "Nivel_después", "Variación",
         "Ubicación", "Google_Maps",
         "Estado_vehículo", "Clasificación"
     ]
@@ -686,38 +697,48 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
         lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
     )
 
-    return out, sensor_comb
+    return out, sensor_comb, serie_merge
 
 
-def agregar_consumo_a_circuitos(circuitos, eventos_comb):
+def agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm):
     if circuitos.empty:
         return circuitos
 
     df = circuitos.copy()
 
-    if eventos_comb.empty:
+    if serie_comb_merge is None or serie_comb_merge.empty:
         df["Combustible_consumido_aprox"] = pd.NA
         df["Eficiencia_estimativa"] = pd.NA
         return df
 
+    col_fecha = sm["fecha"]
+    col_valor = sm["valor"]
+
     consumos = []
     eficiencias = []
 
-    ev = eventos_comb.copy()
-    ev["Fecha_hora"] = pd.to_datetime(ev["Fecha_hora"], errors="coerce")
+    base = serie_comb_merge.copy()
+    base[col_fecha] = pd.to_datetime(base[col_fecha], errors="coerce")
+    base[col_valor] = pd.to_numeric(base[col_valor], errors="coerce")
 
     for _, c in df.iterrows():
         ini = pd.to_datetime(c["Inicio"], errors="coerce")
         fin = pd.to_datetime(c["Fin"], errors="coerce")
         km = safe_float(c["Km"])
 
-        tramo = ev[(ev["Fecha_hora"] >= ini) & (ev["Fecha_hora"] <= fin)].copy()
-        consumo_desc = tramo[tramo["Variación"] < 0]["Variación"].abs().sum()
+        tramo = base[(base[col_fecha] >= ini) & (base[col_fecha] <= fin)].copy()
 
-        consumo_desc = round(float(consumo_desc), 2) if pd.notna(consumo_desc) else 0.0
-        eficiencia = round(consumo_desc / km, 2) if km and km > 0 else pd.NA
+        consumo = 0.0
+        if not tramo.empty:
+            inicio_val = tramo[col_valor].iloc[0]
+            fin_val = tramo[col_valor].iloc[-1]
+            if pd.notna(inicio_val) and pd.notna(fin_val):
+                diff = float(inicio_val) - float(fin_val)
+                consumo = round(diff, 2) if diff > 0 else 0.0
 
-        consumos.append(consumo_desc)
+        eficiencia = round(consumo / km, 2) if km and km > 0 else pd.NA
+
+        consumos.append(consumo)
         eficiencias.append(eficiencia)
 
     df["Combustible_consumido_aprox"] = consumos
@@ -825,6 +846,7 @@ def detectar_patrones_chofer(circuitos):
     resumen["Km_promedio"] = resumen["Km_promedio"].round(2)
     resumen["Duración_promedio"] = resumen["Duración_promedio"].round(2)
     resumen["Velocidad_promedio"] = resumen["Velocidad_promedio"].round(2)
+    resumen["Duración_promedio_hm"] = resumen["Duración_promedio"].apply(fmt_duracion_min)
 
     texto = """
     <p>
@@ -899,19 +921,22 @@ def index():
             tiempo_mov = "No disponible"
             if pd.notna(periodo_ini) and pd.notna(periodo_fin):
                 tiempo_total_min = (periodo_fin - periodo_ini).total_seconds() / 60
-                tiempo_mov = round(max(0, tiempo_total_min - tiempo_det), 2)
+                tiempo_mov = fmt_duracion_min(max(0, tiempo_total_min - tiempo_det))
 
             circuitos = reconstruir_circuitos(gps, gm, base)
             circuitos = clasificar_circuitos(circuitos)
 
-            eventos_comb, sensor_comb = detectar_eventos_combustible(sens, sm, gps, gm)
+            eventos_comb, sensor_comb, serie_comb_merge = detectar_eventos_combustible(sens, sm, gps, gm)
 
             consumo_total = "No disponible"
-            if not eventos_comb.empty:
-                desc = eventos_comb[eventos_comb["Variación"] < 0]["Variación"].abs().sum()
-                consumo_total = round(float(desc), 2)
+            if serie_comb_merge is not None and not serie_comb_merge.empty:
+                col_valor = sm["valor"]
+                serie_tmp = pd.to_numeric(serie_comb_merge[col_valor], errors="coerce").dropna()
+                if len(serie_tmp) >= 2:
+                    diff_total = float(serie_tmp.iloc[0]) - float(serie_tmp.iloc[-1])
+                    consumo_total = round(diff_total, 2) if diff_total > 0 else 0.0
 
-            circuitos = agregar_consumo_a_circuitos(circuitos, eventos_comb)
+            circuitos = agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm)
 
             desvios = detectar_desvios(gps, gm, base)
 
@@ -922,7 +947,7 @@ def index():
                     f'<p><b>Ubicación:</b> {escape(texto_ubicacion(base["localidad"], base["barrio"]))}</p>'
                     f'<p><b>Localidad:</b> {escape(base["localidad"])}</p>'
                     f'<p><b>Barrio:</b> {escape(base["barrio"])}</p>'
-                    f'<p><b>Duración de permanencia:</b> {round(base["duracion_min"], 2)} min</p>'
+                    f'<p><b>Duración de permanencia:</b> {fmt_duracion_min(base["duracion_min"])}</p>'
                     f'<p><b>Ver en Google Maps:</b> <a href="{base["maps"]}" target="_blank">Abrir ubicación</a></p>'
                 )
             else:
@@ -1077,8 +1102,8 @@ def index():
 
                     <div class="section">
                         <h2>1. Resumen Ejecutivo</h2>
-                        <p><b>Tiempo en movimiento:</b> {tiempo_mov} min</p>
-                        <p><b>Tiempo detenido:</b> {tiempo_det} min</p>
+                        <p><b>Tiempo en movimiento:</b> {tiempo_mov}</p>
+                        <p><b>Tiempo detenido:</b> {fmt_duracion_min(tiempo_det)}</p>
                         <p><b>Consumo total de combustible:</b> {consumo_total}</p>
                     </div>
 
@@ -1095,7 +1120,7 @@ def index():
                                     "Circuito",
                                     "Inicio",
                                     "Fin",
-                                    "Duración_min",
+                                    "Duración",
                                     "Km",
                                     "Punto_central",
                                     "Tipo_circuito",
@@ -1103,6 +1128,8 @@ def index():
                                     "Final_marcado",
                                     "Combustible_consumido_aprox",
                                     "Eficiencia_estimativa",
+                                    "Google_Maps_Inicio",
+                                    "Google_Maps_Final",
                                     "Google_Maps_Recorrido"
                                 ]],
                                 index=False
@@ -1114,7 +1141,7 @@ def index():
                         <h2>4. Análisis de detenciones fuera de base</h2>
                         {
                             html_tabla(
-                                det_fuera[["Inicio", "Fin", "Duración_min", "Ubicación", "Google_Maps", "Interpretación_operativa"]],
+                                det_fuera[["Inicio", "Fin", "Duración", "Ubicación", "Google_Maps", "Interpretación_operativa"]],
                                 index=False
                             ) if not det_fuera.empty else "<p>No se detectaron detenciones fuera de base relevantes.</p>"
                         }

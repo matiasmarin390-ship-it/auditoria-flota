@@ -4,4 +4,3 @@ numpy
 gunicorn
 openpyxl
 xlrd
-requests

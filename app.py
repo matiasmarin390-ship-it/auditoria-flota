@@ -10,9 +10,9 @@ app = Flask(__name__)
 # =========================================
 # CONFIGURACIÓN
 # =========================================
-UMBRAL_DETENCION_MIN = 5
+UMBRAL_DETENCION_MIN = 6
 UMBRAL_CAMBIO_COMBUSTIBLE = 5.0
-DISTANCIA_BASE_METROS = 300
+DISTANCIA_BASE_METROS = 100          # una cuadra aprox
 DISTANCIA_DESVIO_METROS = 800
 VELOCIDAD_MOVIMIENTO = 3
 MAX_WAYPOINTS_MAPS = 8
@@ -350,6 +350,7 @@ def detectar_detenciones(gps, gm):
                     ini,
                     fin,
                     round(mins, 2),
+                    fmt_duracion_min(mins),
                     texto_ubicacion(geo["localidad"], geo["barrio"]),
                     geo["localidad"],
                     geo["barrio"],
@@ -378,6 +379,7 @@ def detectar_detenciones(gps, gm):
                 ini,
                 fin,
                 round(mins, 2),
+                fmt_duracion_min(mins),
                 texto_ubicacion(geo["localidad"], geo["barrio"]),
                 geo["localidad"],
                 geo["barrio"],
@@ -387,12 +389,11 @@ def detectar_detenciones(gps, gm):
             ])
 
     df = pd.DataFrame(eventos, columns=[
-        "Inicio", "Fin", "Duración_min", "Ubicación", "Localidad", "Barrio",
+        "Inicio", "Fin", "Duración_min", "Duración", "Ubicación", "Localidad", "Barrio",
         "Lat", "Lon", "Google_Maps"
     ])
 
     if not df.empty:
-        df["Duración"] = df["Duración_min"].apply(fmt_duracion_min)
         df["Google_Maps"] = df["Google_Maps"].apply(
             lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
         )
@@ -608,7 +609,6 @@ def clasificar_circuitos(circuitos):
 def detectar_sensor_combustible(sens, sm):
     col_sensor = sm["sensor"]
 
-    # prioridad por nombre contenido
     candidatos = sens[
         sens[col_sensor].astype(str).str.lower().str.contains("nivel de combustible", na=False)
     ][col_sensor].dropna().unique().tolist()
@@ -668,10 +668,10 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
 
         if r["delta"] > 0:
             clasifs.append("Carga de combustible")
-        elif r["delta"] < 0 and detenido:
-            clasifs.append("Posible robo / extracción")
+        elif r["delta"] <= -UMBRAL_CAMBIO_COMBUSTIBLE and detenido:
+            clasifs.append("Anómalo - posible robo / extracción")
         else:
-            clasifs.append("Consumo / descenso brusco")
+            clasifs.append("Consumo / descenso operativo")
 
         geo = extraer_localidad_barrio_desde_texto(r["_direccion_raw"])
         ubicaciones.append(texto_ubicacion(geo["localidad"], geo["barrio"]))
@@ -778,6 +778,42 @@ def detectar_desvios(gps, gm, base):
     }, inplace=True)
 
     return out.head(50)
+
+
+# =========================================
+# FILTRO FINAL DE DETENCIONES FUERA DE BASE
+# =========================================
+def filtrar_detenciones_fuera_de_base(det_fuera, circuitos):
+    if det_fuera.empty:
+        return det_fuera
+
+    habituales = pd.DataFrame()
+    if not circuitos.empty:
+        habituales = circuitos[circuitos["Tipo_circuito"] == "Habitual"].copy()
+
+    rows = []
+    for _, det in det_fuera.iterrows():
+        if det["Duración_min"] <= UMBRAL_DETENCION_MIN:
+            continue
+
+        pertenece_habitual = False
+        for _, c in habituales.iterrows():
+            ini = pd.to_datetime(c["Inicio"])
+            fin = pd.to_datetime(c["Fin"])
+            det_ini = pd.to_datetime(det["Inicio"])
+            det_fin = pd.to_datetime(det["Fin"])
+
+            if det_ini >= ini and det_fin <= fin:
+                pertenece_habitual = True
+                break
+
+        if not pertenece_habitual:
+            rows.append(det)
+
+    if not rows:
+        return pd.DataFrame(columns=det_fuera.columns)
+
+    return pd.DataFrame(rows)
 
 
 # =========================================
@@ -911,11 +947,6 @@ def index():
 
             det_fuera = detenciones[detenciones["Es_base"] == False].copy() if not detenciones.empty else pd.DataFrame()
 
-            if not det_fuera.empty:
-                det_fuera["Interpretación_operativa"] = det_fuera["Duración_min"].apply(
-                    lambda x: "Detención operativa breve" if x <= 15 else "Detención prolongada / revisar actividad"
-                )
-
             tiempo_det = round(detenciones["Duración_min"].sum(), 2) if not detenciones.empty else 0
 
             tiempo_mov = "No disponible"
@@ -925,6 +956,13 @@ def index():
 
             circuitos = reconstruir_circuitos(gps, gm, base)
             circuitos = clasificar_circuitos(circuitos)
+
+            det_fuera = filtrar_detenciones_fuera_de_base(det_fuera, circuitos)
+
+            if not det_fuera.empty:
+                det_fuera["Interpretación_operativa"] = det_fuera["Duración_min"].apply(
+                    lambda x: "Detención fuera de base no habitual" if x > UMBRAL_DETENCION_MIN else "No relevante"
+                )
 
             eventos_comb, sensor_comb, serie_comb_merge = detectar_eventos_combustible(sens, sm, gps, gm)
 
@@ -1333,7 +1371,5 @@ def index():
     </body>
     </html>
     '''
-
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

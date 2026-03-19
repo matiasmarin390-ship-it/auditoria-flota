@@ -4,6 +4,7 @@ import io
 import math
 import requests
 from html import escape
+from urllib.parse import urlencode, quote
 
 app = Flask(__name__)
 
@@ -18,6 +19,8 @@ VELOCIDAD_MOVIMIENTO = 3
 
 # Circuitos
 UMBRAL_SIMILITUD_CIRCUITO_METROS = 2500
+MAX_WAYPOINTS_MAPS = 8          # conservador para Google Maps URL
+MAX_GEOCODE_CALLS = 30          # límite de seguridad por corrida
 
 # Geocodificación
 GEOCODE_USER_AGENT = "auditoria-flota-rt/1.0"
@@ -25,6 +28,7 @@ GEOCODE_TIMEOUT = 8
 
 # Cache simple en memoria
 GEOCODE_CACHE = {}
+GEOCODE_CALLS = 0
 
 
 # =========================================
@@ -128,18 +132,6 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def aproximar_ubicacion(lat, lon):
-    if pd.isna(lat) or pd.isna(lon):
-        return "Ubicación no disponible"
-    return f"Lat {round(lat, 6)}, Lon {round(lon, 6)}"
-
-
-def link_google_maps(lat, lon):
-    if pd.isna(lat) or pd.isna(lon):
-        return ""
-    return f"https://www.google.com/maps?q={lat},{lon}"
-
-
 def safe_float(value):
     try:
         if pd.isna(value):
@@ -149,24 +141,98 @@ def safe_float(value):
         return None
 
 
+def texto_ubicacion(localidad, barrio):
+    partes = []
+    if barrio and barrio != "Barrio no identificado":
+        partes.append(barrio)
+    if localidad and localidad != "Localidad no identificada":
+        partes.append(localidad)
+    return ", ".join(partes) if partes else "Ubicación no identificada"
+
+
+def maps_pin_url(lat, lon):
+    if pd.isna(lat) or pd.isna(lon):
+        return ""
+    return f"https://www.google.com/maps?q={lat},{lon}"
+
+
+def sample_indices(n, max_points):
+    if n <= 0:
+        return []
+    if n <= max_points:
+        return list(range(n))
+    step = (n - 1) / (max_points - 1)
+    idxs = [round(i * step) for i in range(max_points)]
+    # preservar orden y unicidad
+    out = []
+    seen = set()
+    for i in idxs:
+        if i not in seen:
+            out.append(i)
+            seen.add(i)
+    return out
+
+
+def maps_route_url(points_df):
+    """
+    Genera un link de Google Maps con origen, destino y waypoints
+    para ver el recorrido dibujado de manera aproximada.
+    """
+    if points_df is None or points_df.empty or len(points_df) < 2:
+        return ""
+
+    pts = points_df[["_lat", "_lon"]].dropna().reset_index(drop=True)
+    if len(pts) < 2:
+        return ""
+
+    idxs = sample_indices(len(pts), min(MAX_WAYPOINTS_MAPS + 2, len(pts)))
+    sampled = pts.iloc[idxs].reset_index(drop=True)
+
+    origin = f"{sampled.iloc[0]['_lat']},{sampled.iloc[0]['_lon']}"
+    destination = f"{sampled.iloc[-1]['_lat']},{sampled.iloc[-1]['_lon']}"
+
+    waypoints = []
+    if len(sampled) > 2:
+        for i in range(1, len(sampled) - 1):
+            waypoints.append(f"{sampled.iloc[i]['_lat']},{sampled.iloc[i]['_lon']}")
+
+    params = {
+        "api": "1",
+        "origin": origin,
+        "destination": destination,
+        "travelmode": "driving"
+    }
+
+    if waypoints:
+        params["waypoints"] = "|".join(waypoints)
+
+    return "https://www.google.com/maps/dir/?" + urlencode(params, safe="|,:")
+
+
 # =========================================
 # GEOCODIFICACIÓN INVERSA
-# SOLO para puntos clave
 # =========================================
-def localidad_real(lat, lon):
+def localidad_barrio_real(lat, lon):
+    global GEOCODE_CALLS
+
     if pd.isna(lat) or pd.isna(lon):
-        return "Localidad no disponible"
+        return {"localidad": "Localidad no identificada", "barrio": "Barrio no identificado"}
 
     key = (round(float(lat), 5), round(float(lon), 5))
     if key in GEOCODE_CACHE:
         return GEOCODE_CACHE[key]
+
+    if GEOCODE_CALLS >= MAX_GEOCODE_CALLS:
+        data = {"localidad": "Localidad no calculada", "barrio": "Barrio no calculado"}
+        GEOCODE_CACHE[key] = data
+        return data
 
     url = "https://nominatim.openstreetmap.org/reverse"
     params = {
         "lat": float(lat),
         "lon": float(lon),
         "format": "jsonv2",
-        "zoom": 14,
+        "zoom": 16,
         "addressdetails": 1
     }
     headers = {
@@ -174,6 +240,7 @@ def localidad_real(lat, lon):
     }
 
     try:
+        GEOCODE_CALLS += 1
         r = requests.get(url, params=params, headers=headers, timeout=GEOCODE_TIMEOUT)
         r.raise_for_status()
         data = r.json()
@@ -183,28 +250,27 @@ def localidad_real(lat, lon):
             addr.get("city")
             or addr.get("town")
             or addr.get("village")
-            or addr.get("suburb")
             or addr.get("municipality")
             or addr.get("county")
             or "Localidad no identificada"
         )
 
-        estado = addr.get("state", "")
-        pais = addr.get("country", "")
+        barrio = (
+            addr.get("suburb")
+            or addr.get("neighbourhood")
+            or addr.get("quarter")
+            or addr.get("hamlet")
+            or "Barrio no identificado"
+        )
 
-        texto = localidad
-        if estado:
-            texto += f", {estado}"
-        if pais:
-            texto += f", {pais}"
-
-        GEOCODE_CACHE[key] = texto
-        return texto
+        out = {"localidad": localidad, "barrio": barrio}
+        GEOCODE_CACHE[key] = out
+        return out
 
     except Exception:
-        texto = f"Localidad no disponible ({round(float(lat), 4)}, {round(float(lon), 4)})"
-        GEOCODE_CACHE[key] = texto
-        return texto
+        out = {"localidad": "Localidad no disponible", "barrio": "Barrio no disponible"}
+        GEOCODE_CACHE[key] = out
+        return out
 
 
 # =========================================
@@ -215,7 +281,6 @@ def preparar_gps(df):
     col_vel = buscar_columna(df, ["velocidad", "speed"])
     col_odo = buscar_columna(df, ["odómetro", "odometro", "odometer"])
     col_coord = buscar_columna(df, ["coordenadas", "coordinates"])
-    col_ubi = buscar_columna(df, ["ubicación", "ubicacion", "address", "direccion", "dirección"])
 
     if not col_fecha:
         raise Exception(f"El archivo GPS debe tener columna de fecha. Detectadas: {list(df.columns)}")
@@ -269,8 +334,7 @@ def preparar_gps(df):
     return gps, {
         "fecha": col_fecha,
         "vel": col_vel,
-        "odo": col_odo,
-        "ubi": col_ubi
+        "odo": col_odo
     }
 
 
@@ -326,14 +390,18 @@ def detectar_detenciones(gps, gm):
             if mins >= UMBRAL_DETENCION_MIN:
                 lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
                 lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
+                geo = localidad_barrio_real(lat_m, lon_m)
+
                 eventos.append([
                     ini,
                     fin,
                     round(mins, 2),
+                    texto_ubicacion(geo["localidad"], geo["barrio"]),
+                    geo["localidad"],
+                    geo["barrio"],
                     lat_m,
                     lon_m,
-                    aproximar_ubicacion(lat_m, lon_m),
-                    link_google_maps(lat_m, lon_m)
+                    maps_pin_url(lat_m, lon_m)
                 ])
 
             en_det = False
@@ -347,19 +415,23 @@ def detectar_detenciones(gps, gm):
         if mins >= UMBRAL_DETENCION_MIN:
             lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
             lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
+            geo = localidad_barrio_real(lat_m, lon_m)
+
             eventos.append([
                 ini,
                 fin,
                 round(mins, 2),
+                texto_ubicacion(geo["localidad"], geo["barrio"]),
+                geo["localidad"],
+                geo["barrio"],
                 lat_m,
                 lon_m,
-                aproximar_ubicacion(lat_m, lon_m),
-                link_google_maps(lat_m, lon_m)
+                maps_pin_url(lat_m, lon_m)
             ])
 
     df = pd.DataFrame(eventos, columns=[
-        "Inicio", "Fin", "Duración_min", "Lat", "Lon",
-        "Ubicación_aprox", "Google_Maps"
+        "Inicio", "Fin", "Duración_min", "Ubicación", "Localidad", "Barrio",
+        "Lat", "Lon", "Google_Maps"
     ])
 
     if not df.empty:
@@ -384,9 +456,10 @@ def detectar_base_operativa(detenciones):
         "lat": b["Lat"],
         "lon": b["Lon"],
         "duracion_min": b["Duración_min"],
-        "ubicacion": b["Ubicación_aprox"],
-        "localidad": localidad_real(b["Lat"], b["Lon"]),
-        "maps": link_google_maps(b["Lat"], b["Lon"])
+        "ubicacion": b["Ubicación"],
+        "localidad": b["Localidad"],
+        "barrio": b["Barrio"],
+        "maps": maps_pin_url(b["Lat"], b["Lon"])
     }
 
 
@@ -448,12 +521,15 @@ def reconstruir_circuitos(gps, gm, base):
             lat_prom = tramo["_lat"].mean()
             lon_prom = tramo["_lon"].mean()
 
-            loc_centro = localidad_real(lat_prom, lon_prom)
-            centro = aproximar_ubicacion(lat_prom, lon_prom)
-            maps = link_google_maps(lat_prom, lon_prom)
+            geo_centro = localidad_barrio_real(lat_prom, lon_prom)
+            punto_central = texto_ubicacion(geo_centro["localidad"], geo_centro["barrio"])
+            maps_circuito = maps_route_url(tramo)
 
-            inicio_coord = aproximar_ubicacion(tramo.iloc[0]["_lat"], tramo.iloc[0]["_lon"])
-            fin_coord = aproximar_ubicacion(tramo.iloc[-1]["_lat"], tramo.iloc[-1]["_lon"])
+            geo_ini = localidad_barrio_real(tramo.iloc[0]["_lat"], tramo.iloc[0]["_lon"])
+            geo_fin = localidad_barrio_real(tramo.iloc[-1]["_lat"], tramo.iloc[-1]["_lon"])
+
+            punto_inicio = texto_ubicacion(geo_ini["localidad"], geo_ini["barrio"])
+            punto_final = texto_ubicacion(geo_fin["localidad"], geo_fin["barrio"])
 
             vel_prom = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").mean(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
             vel_max = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").max(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
@@ -465,11 +541,10 @@ def reconstruir_circuitos(gps, gm, base):
                 fin,
                 round(dur, 2),
                 km,
-                loc_centro,
-                centro,
-                maps,
-                inicio_coord,
-                fin_coord,
+                punto_central,
+                punto_inicio,
+                punto_final,
+                maps_circuito,
                 vel_prom,
                 vel_max,
                 hora_salida,
@@ -485,11 +560,10 @@ def reconstruir_circuitos(gps, gm, base):
         "Fin",
         "Duración_min",
         "Km",
-        "Localidad_centro",
         "Punto_central",
-        "Google_Maps",
         "Punto_inicio",
         "Punto_final",
+        "Google_Maps_Recorrido",
         "Velocidad_promedio",
         "Velocidad_máxima",
         "Hora_salida",
@@ -498,8 +572,8 @@ def reconstruir_circuitos(gps, gm, base):
     ])
 
     if not df.empty:
-        df["Google_Maps"] = df["Google_Maps"].apply(
-            lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
+        df["Google_Maps_Recorrido"] = df["Google_Maps_Recorrido"].apply(
+            lambda x: f'<a href="{x}" target="_blank">Ver recorrido</a>' if x else ""
         )
 
     return df
@@ -538,11 +612,11 @@ def clasificar_circuitos(circuitos):
         lambda f: "Habitual" if freq.get(f, 0) >= 2 else "Anómalo"
     )
 
-    df["Punto_inicio_marcado"] = df.apply(
+    df["Inicio_marcado"] = df.apply(
         lambda r: f'🔴 {r["Punto_inicio"]}' if r["Tipo_circuito"] == "Anómalo" else r["Punto_inicio"],
         axis=1
     )
-    df["Punto_final_marcado"] = df.apply(
+    df["Final_marcado"] = df.apply(
         lambda r: f'🔴 {r["Punto_final"]}' if r["Tipo_circuito"] == "Anómalo" else r["Punto_final"],
         axis=1
     )
@@ -555,12 +629,18 @@ def clasificar_circuitos(circuitos):
 # =========================================
 def detectar_sensor_combustible(sens, sm):
     col_sensor = sm["sensor"]
-    sensores = sens[col_sensor].dropna().unique().tolist()
 
+    # PRIORIDAD EXACTA
+    exactos = sens[sens[col_sensor].astype(str).str.strip().str.lower() == "nivel de combustible (%)".lower()]
+    if not exactos.empty:
+        return "Nivel de combustible (%)"
+
+    # Fallback
+    sensores = sens[col_sensor].dropna().unique().tolist()
     candidatos = []
     for s in sensores:
         sn = norm(s)
-        if "fuel" in sn or "combustible" in sn:
+        if "nivel de combustible" in sn or "fuel level" in sn or "combustible" in sn:
             candidatos.append(s)
 
     if not candidatos:
@@ -568,7 +648,7 @@ def detectar_sensor_combustible(sens, sm):
 
     for c in candidatos:
         cn = norm(c)
-        if "level" in cn or "nivel" in cn or "%" in cn:
+        if "nivel de combustible" in cn or "%" in cn or "level" in cn:
             return c
 
     return candidatos[0]
@@ -583,7 +663,7 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
     if sensor_comb is None:
         return pd.DataFrame(), None
 
-    df = sens[sens[col_sensor] == sensor_comb].copy().sort_values(col_fecha)
+    df = sens[sens[col_sensor].astype(str).str.strip() == str(sensor_comb)].copy().sort_values(col_fecha)
     df["prev_valor"] = df[col_valor].shift(1)
     df["delta"] = df[col_valor] - df["prev_valor"]
 
@@ -607,6 +687,7 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
 
     estados = []
     clasifs = []
+    ubicaciones = []
 
     for _, r in merge.iterrows():
         vel = r[gv] if gv and gv in merge.columns else None
@@ -620,21 +701,23 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
         else:
             clasifs.append("Descenso brusco")
 
-    merge["Ubicación_aprox"] = merge.apply(lambda r: aproximar_ubicacion(r["_lat"], r["_lon"]), axis=1)
-    merge["Localidad"] = "No calculada"
-    merge["Google_Maps"] = merge.apply(lambda r: link_google_maps(r["_lat"], r["_lon"]), axis=1)
+        geo = localidad_barrio_real(r["_lat"], r["_lon"])
+        ubicaciones.append(texto_ubicacion(geo["localidad"], geo["barrio"]))
+
+    merge["Ubicación"] = ubicaciones
+    merge["Google_Maps"] = merge.apply(lambda r: maps_pin_url(r["_lat"], r["_lon"]), axis=1)
     merge["Estado_vehículo"] = estados
     merge["Clasificación"] = clasifs
 
     out = merge[[
         col_fecha, "prev_valor", col_valor, "delta",
-        "Ubicación_aprox", "Localidad", "Google_Maps",
+        "Ubicación", "Google_Maps",
         "Estado_vehículo", "Clasificación"
     ]].copy()
 
     out.columns = [
         "Fecha_hora", "Porcentaje_antes", "Porcentaje_después", "Variación",
-        "Ubicación_aprox", "Localidad", "Google_Maps",
+        "Ubicación", "Google_Maps",
         "Estado_vehículo", "Clasificación"
     ]
 
@@ -701,9 +784,8 @@ def detectar_desvios(gps, gm, base):
         return pd.DataFrame()
 
     out = desv[[gf, "_lat", "_lon", "_dist_base_m"]].copy()
-    out["Ubicación_aprox"] = out.apply(lambda r: aproximar_ubicacion(r["_lat"], r["_lon"]), axis=1)
-    out["Localidad"] = "No calculada (optimización)"
-    out["Google_Maps"] = out.apply(lambda r: link_google_maps(r["_lat"], r["_lon"]), axis=1)
+    out["Ubicación"] = "No calculada (optimización)"
+    out["Google_Maps"] = out.apply(lambda r: maps_pin_url(r["_lat"], r["_lon"]), axis=1)
     out["Google_Maps"] = out["Google_Maps"].apply(
         lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
     )
@@ -798,6 +880,9 @@ def detectar_patrones_chofer(circuitos):
 # =========================================
 @app.route("/", methods=["GET", "POST"])
 def index():
+    global GEOCODE_CALLS
+    GEOCODE_CALLS = 0
+
     if request.method == "POST":
         try:
             if "sensores" not in request.files or "historico" not in request.files:
@@ -873,6 +958,17 @@ def index():
             desvios = detectar_desvios(gps, gm, base)
 
             patrones_texto, patrones_df = detectar_patrones_chofer(circuitos)
+
+            if base:
+                base_html = (
+                    f'<p><b>Ubicación:</b> {escape(texto_ubicacion(base["localidad"], base["barrio"]))}</p>'
+                    f'<p><b>Localidad:</b> {escape(base["localidad"])}</p>'
+                    f'<p><b>Barrio:</b> {escape(base["barrio"])}</p>'
+                    f'<p><b>Duración de permanencia:</b> {round(base["duracion_min"], 2)} min</p>'
+                    f'<p><b>Ver en Google Maps:</b> <a href="{base["maps"]}" target="_blank">Abrir ubicación</a></p>'
+                )
+            else:
+                base_html = "<p>No fue posible identificar base operativa.</p>"
 
             html = f"""
             <html>
@@ -997,8 +1093,8 @@ def index():
                         <h1>Informe Técnico de Auditoría de Flota</h1>
                         <p>
                             Análisis cruzado entre histórico GPS y sensores del vehículo.
-                            Evaluación de base operativa, circuitos, combustible, desvíos
-                            y patrones de conducción.
+                            Evaluación de base operativa, circuitos, consumo de combustible,
+                            desvíos y patrones de conducción.
                         </p>
                     </div>
 
@@ -1030,16 +1126,7 @@ def index():
 
                     <div class="section">
                         <h2>2. Identificación de base operativa</h2>
-                        {
-                            f'''
-                            <p><b>Ubicación detectada:</b> {escape(base["ubicacion"])}</p>
-                            <p><b>Localidad real:</b> {escape(base["localidad"])}</p>
-                            <p><b>Duración de permanencia:</b> {round(base["duracion_min"], 2)} min</p>
-                            <p><b>Ver en Google Maps:</b> <a href="{base["maps"]}" target="_blank">Abrir ubicación</a></p>
-                            '''
-                            if base else
-                            "<p>No fue posible identificar base operativa.</p>"
-                        }
+                        {base_html}
                     </div>
 
                     <div class="section">
@@ -1053,13 +1140,12 @@ def index():
                                     "Duración_min",
                                     "Km",
                                     "Punto_central",
-                                    "Localidad_centro",
                                     "Tipo_circuito",
-                                    "Punto_inicio_marcado",
-                                    "Punto_final_marcado",
+                                    "Inicio_marcado",
+                                    "Final_marcado",
                                     "Combustible_consumido_aprox",
                                     "Eficiencia_estimativa",
-                                    "Google_Maps"
+                                    "Google_Maps_Recorrido"
                                 ]],
                                 index=False
                             ) if not circuitos.empty else "<p>Sin circuitos detectados.</p>"
@@ -1070,7 +1156,7 @@ def index():
                         <h2>4. Análisis de detenciones fuera de base</h2>
                         {
                             html_tabla(
-                                det_fuera[["Inicio", "Fin", "Duración_min", "Ubicación_aprox", "Google_Maps", "Interpretación_operativa"]],
+                                det_fuera[["Inicio", "Fin", "Duración_min", "Ubicación", "Google_Maps", "Interpretación_operativa"]],
                                 index=False
                             ) if not det_fuera.empty else "<p>No se detectaron detenciones fuera de base relevantes.</p>"
                         }
@@ -1080,7 +1166,7 @@ def index():
                         <h2>5. Detección de desvíos</h2>
                         {
                             html_tabla(
-                                desvios[["Fecha_hora", "Distancia_a_base_m", "Ubicación_aprox", "Google_Maps"]],
+                                desvios[["Fecha_hora", "Distancia_a_base_m", "Ubicación", "Google_Maps"]],
                                 index=False
                             ) if not desvios.empty else "<p>No se detectaron desvíos relevantes con la configuración actual.</p>"
                         }
@@ -1228,7 +1314,8 @@ def index():
                 <p>
                     Plataforma de análisis cruzado entre histórico GPS y sensores.
                     Identifica base operativa, circuitos habituales y anómalos,
-                    analiza combustible y detecta patrones de conducción.
+                    dibuja recorridos en Google Maps, analiza consumo de combustible
+                    y detecta patrones de conducción.
                 </p>
             </div>
 

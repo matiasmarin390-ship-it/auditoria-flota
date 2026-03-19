@@ -2,9 +2,8 @@ from flask import Flask, request
 import pandas as pd
 import io
 import math
-import requests
 from html import escape
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode
 
 app = Flask(__name__)
 
@@ -16,19 +15,7 @@ UMBRAL_CAMBIO_COMBUSTIBLE = 5.0
 DISTANCIA_BASE_METROS = 300
 DISTANCIA_DESVIO_METROS = 800
 VELOCIDAD_MOVIMIENTO = 3
-
-# Circuitos
-UMBRAL_SIMILITUD_CIRCUITO_METROS = 2500
-MAX_WAYPOINTS_MAPS = 8          # conservador para Google Maps URL
-MAX_GEOCODE_CALLS = 30          # límite de seguridad por corrida
-
-# Geocodificación
-GEOCODE_USER_AGENT = "auditoria-flota-rt/1.0"
-GEOCODE_TIMEOUT = 8
-
-# Cache simple en memoria
-GEOCODE_CACHE = {}
-GEOCODE_CALLS = 0
+MAX_WAYPOINTS_MAPS = 8
 
 
 # =========================================
@@ -71,13 +58,11 @@ def leer_archivo_flexible(archivo):
                     engine="python",
                     on_bad_lines="skip"
                 )
-
                 if df is not None and len(df.columns) > 1:
                     return df
 
                 if mejor_df is None or len(df.columns) > len(mejor_df.columns):
                     mejor_df = df
-
             except Exception:
                 continue
 
@@ -118,6 +103,15 @@ def html_tabla(df, index=False):
     return df.to_html(index=index, border=1, escape=False)
 
 
+def safe_float(value):
+    try:
+        if pd.isna(value):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
 def haversine_m(lat1, lon1, lat2, lon2):
     if any(pd.isna(v) for v in [lat1, lon1, lat2, lon2]):
         return None
@@ -130,24 +124,6 @@ def haversine_m(lat1, lon1, lat2, lon2):
 
     a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-def safe_float(value):
-    try:
-        if pd.isna(value):
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
-def texto_ubicacion(localidad, barrio):
-    partes = []
-    if barrio and barrio != "Barrio no identificado":
-        partes.append(barrio)
-    if localidad and localidad != "Localidad no identificada":
-        partes.append(localidad)
-    return ", ".join(partes) if partes else "Ubicación no identificada"
 
 
 def maps_pin_url(lat, lon):
@@ -163,7 +139,6 @@ def sample_indices(n, max_points):
         return list(range(n))
     step = (n - 1) / (max_points - 1)
     idxs = [round(i * step) for i in range(max_points)]
-    # preservar orden y unicidad
     out = []
     seen = set()
     for i in idxs:
@@ -174,10 +149,6 @@ def sample_indices(n, max_points):
 
 
 def maps_route_url(points_df):
-    """
-    Genera un link de Google Maps con origen, destino y waypoints
-    para ver el recorrido dibujado de manera aproximada.
-    """
     if points_df is None or points_df.empty or len(points_df) < 2:
         return ""
 
@@ -209,68 +180,41 @@ def maps_route_url(points_df):
     return "https://www.google.com/maps/dir/?" + urlencode(params, safe="|,:")
 
 
-# =========================================
-# GEOCODIFICACIÓN INVERSA
-# =========================================
-def localidad_barrio_real(lat, lon):
-    global GEOCODE_CALLS
+def extraer_localidad_barrio_desde_texto(texto):
+    """
+    Intenta sacar barrio/localidad desde una dirección del archivo.
+    No inventa datos. Si no puede, devuelve 'no disponible'.
+    """
+    if pd.isna(texto):
+        return {"localidad": "Localidad no disponible", "barrio": "Barrio no disponible"}
 
-    if pd.isna(lat) or pd.isna(lon):
-        return {"localidad": "Localidad no identificada", "barrio": "Barrio no identificado"}
+    t = str(texto).strip()
+    if not t:
+        return {"localidad": "Localidad no disponible", "barrio": "Barrio no disponible"}
 
-    key = (round(float(lat), 5), round(float(lon), 5))
-    if key in GEOCODE_CACHE:
-        return GEOCODE_CACHE[key]
+    # Heurística simple: separar por coma
+    partes = [p.strip() for p in t.split(",") if p.strip()]
 
-    if GEOCODE_CALLS >= MAX_GEOCODE_CALLS:
-        data = {"localidad": "Localidad no calculada", "barrio": "Barrio no calculado"}
-        GEOCODE_CACHE[key] = data
-        return data
+    barrio = "Barrio no disponible"
+    localidad = "Localidad no disponible"
 
-    url = "https://nominatim.openstreetmap.org/reverse"
-    params = {
-        "lat": float(lat),
-        "lon": float(lon),
-        "format": "jsonv2",
-        "zoom": 16,
-        "addressdetails": 1
-    }
-    headers = {
-        "User-Agent": GEOCODE_USER_AGENT
-    }
+    if len(partes) >= 1:
+        barrio = partes[0]
+    if len(partes) >= 2:
+        localidad = partes[1]
+    elif len(partes) == 1:
+        localidad = partes[0]
 
-    try:
-        GEOCODE_CALLS += 1
-        r = requests.get(url, params=params, headers=headers, timeout=GEOCODE_TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        addr = data.get("address", {})
+    return {"localidad": localidad, "barrio": barrio}
 
-        localidad = (
-            addr.get("city")
-            or addr.get("town")
-            or addr.get("village")
-            or addr.get("municipality")
-            or addr.get("county")
-            or "Localidad no identificada"
-        )
 
-        barrio = (
-            addr.get("suburb")
-            or addr.get("neighbourhood")
-            or addr.get("quarter")
-            or addr.get("hamlet")
-            or "Barrio no identificado"
-        )
-
-        out = {"localidad": localidad, "barrio": barrio}
-        GEOCODE_CACHE[key] = out
-        return out
-
-    except Exception:
-        out = {"localidad": "Localidad no disponible", "barrio": "Barrio no disponible"}
-        GEOCODE_CACHE[key] = out
-        return out
+def texto_ubicacion(localidad, barrio):
+    partes = []
+    if barrio and barrio != "Barrio no disponible":
+        partes.append(barrio)
+    if localidad and localidad != "Localidad no disponible":
+        partes.append(localidad)
+    return ", ".join(partes) if partes else "Ubicación no disponible"
 
 
 # =========================================
@@ -281,6 +225,7 @@ def preparar_gps(df):
     col_vel = buscar_columna(df, ["velocidad", "speed"])
     col_odo = buscar_columna(df, ["odómetro", "odometro", "odometer"])
     col_coord = buscar_columna(df, ["coordenadas", "coordinates"])
+    col_ubi = buscar_columna(df, ["ubicación", "ubicacion", "address", "direccion", "dirección", "location"])
 
     if not col_fecha:
         raise Exception(f"El archivo GPS debe tener columna de fecha. Detectadas: {list(df.columns)}")
@@ -314,6 +259,8 @@ def preparar_gps(df):
     if col_odo:
         gps[col_odo] = pd.to_numeric(gps[col_odo], errors="coerce")
 
+    gps["_direccion_raw"] = gps[col_ubi] if col_ubi and col_ubi in gps.columns else ""
+
     gps = gps.dropna(subset=[col_fecha, "_lat", "_lon"]).sort_values(col_fecha).reset_index(drop=True)
 
     gps["_dist_m"] = 0.0
@@ -334,7 +281,8 @@ def preparar_gps(df):
     return gps, {
         "fecha": col_fecha,
         "vel": col_vel,
-        "odo": col_odo
+        "odo": col_odo,
+        "ubi": col_ubi
     }
 
 
@@ -390,7 +338,10 @@ def detectar_detenciones(gps, gm):
             if mins >= UMBRAL_DETENCION_MIN:
                 lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
                 lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
-                geo = localidad_barrio_real(lat_m, lon_m)
+
+                texto_dir = gps.loc[ini_idx:fin_idx, "_direccion_raw"].dropna().astype(str)
+                dir_ref = texto_dir.mode().iloc[0] if not texto_dir.empty else ""
+                geo = extraer_localidad_barrio_desde_texto(dir_ref)
 
                 eventos.append([
                     ini,
@@ -415,7 +366,10 @@ def detectar_detenciones(gps, gm):
         if mins >= UMBRAL_DETENCION_MIN:
             lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
             lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
-            geo = localidad_barrio_real(lat_m, lon_m)
+
+            texto_dir = gps.loc[ini_idx:fin_idx, "_direccion_raw"].dropna().astype(str)
+            dir_ref = texto_dir.mode().iloc[0] if not texto_dir.empty else ""
+            geo = extraer_localidad_barrio_desde_texto(dir_ref)
 
             eventos.append([
                 ini,
@@ -521,15 +475,24 @@ def reconstruir_circuitos(gps, gm, base):
             lat_prom = tramo["_lat"].mean()
             lon_prom = tramo["_lon"].mean()
 
-            geo_centro = localidad_barrio_real(lat_prom, lon_prom)
-            punto_central = texto_ubicacion(geo_centro["localidad"], geo_centro["barrio"])
-            maps_circuito = maps_route_url(tramo)
+            # Centro del circuito: sacar localidad/barrio desde direcciones del tramo
+            texto_dir = tramo["_direccion_raw"].dropna().astype(str)
+            dir_ref = texto_dir.mode().iloc[0] if not texto_dir.empty else ""
+            geo_centro = extraer_localidad_barrio_desde_texto(dir_ref)
 
-            geo_ini = localidad_barrio_real(tramo.iloc[0]["_lat"], tramo.iloc[0]["_lon"])
-            geo_fin = localidad_barrio_real(tramo.iloc[-1]["_lat"], tramo.iloc[-1]["_lon"])
+            punto_central = texto_ubicacion(geo_centro["localidad"], geo_centro["barrio"])
+
+            # Inicio y final
+            dir_ini = str(tramo.iloc[0]["_direccion_raw"]) if pd.notna(tramo.iloc[0]["_direccion_raw"]) else ""
+            dir_fin = str(tramo.iloc[-1]["_direccion_raw"]) if pd.notna(tramo.iloc[-1]["_direccion_raw"]) else ""
+
+            geo_ini = extraer_localidad_barrio_desde_texto(dir_ini)
+            geo_fin = extraer_localidad_barrio_desde_texto(dir_fin)
 
             punto_inicio = texto_ubicacion(geo_ini["localidad"], geo_ini["barrio"])
             punto_final = texto_ubicacion(geo_fin["localidad"], geo_fin["barrio"])
+
+            maps_circuito = maps_route_url(tramo)
 
             vel_prom = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").mean(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
             vel_max = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").max(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
@@ -630,12 +593,10 @@ def clasificar_circuitos(circuitos):
 def detectar_sensor_combustible(sens, sm):
     col_sensor = sm["sensor"]
 
-    # PRIORIDAD EXACTA
     exactos = sens[sens[col_sensor].astype(str).str.strip().str.lower() == "nivel de combustible (%)".lower()]
     if not exactos.empty:
         return "Nivel de combustible (%)"
 
-    # Fallback
     sensores = sens[col_sensor].dropna().unique().tolist()
     candidatos = []
     for s in sensores:
@@ -679,7 +640,7 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
 
     merge = pd.merge_asof(
         eventos,
-        gps_sorted[[gf, "_lat", "_lon"] + ([gv] if gv else [])].sort_values(gf),
+        gps_sorted[[gf, "_lat", "_lon", "_direccion_raw"] + ([gv] if gv else [])].sort_values(gf),
         left_on=col_fecha,
         right_on=gf,
         direction="nearest"
@@ -701,7 +662,7 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
         else:
             clasifs.append("Descenso brusco")
 
-        geo = localidad_barrio_real(r["_lat"], r["_lon"])
+        geo = extraer_localidad_barrio_desde_texto(r["_direccion_raw"])
         ubicaciones.append(texto_ubicacion(geo["localidad"], geo["barrio"]))
 
     merge["Ubicación"] = ubicaciones
@@ -783,8 +744,8 @@ def detectar_desvios(gps, gm, base):
     if desv.empty:
         return pd.DataFrame()
 
-    out = desv[[gf, "_lat", "_lon", "_dist_base_m"]].copy()
-    out["Ubicación"] = "No calculada (optimización)"
+    out = desv[[gf, "_lat", "_lon", "_dist_base_m", "_direccion_raw"]].copy()
+    out["Ubicación"] = out["_direccion_raw"].astype(str).replace("nan", "Ubicación no disponible")
     out["Google_Maps"] = out.apply(lambda r: maps_pin_url(r["_lat"], r["_lon"]), axis=1)
     out["Google_Maps"] = out["Google_Maps"].apply(
         lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
@@ -880,9 +841,6 @@ def detectar_patrones_chofer(circuitos):
 # =========================================
 @app.route("/", methods=["GET", "POST"])
 def index():
-    global GEOCODE_CALLS
-    GEOCODE_CALLS = 0
-
     if request.method == "POST":
         try:
             if "sensores" not in request.files or "historico" not in request.files:

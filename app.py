@@ -2,7 +2,6 @@ from flask import Flask, request
 import pandas as pd
 import io
 import math
-import time
 import requests
 from html import escape
 
@@ -22,7 +21,7 @@ UMBRAL_SIMILITUD_CIRCUITO_METROS = 2500
 
 # Geocodificación
 GEOCODE_USER_AGENT = "auditoria-flota-rt/1.0"
-GEOCODE_TIMEOUT = 10
+GEOCODE_TIMEOUT = 8
 
 # Cache simple en memoria
 GEOCODE_CACHE = {}
@@ -150,15 +149,9 @@ def safe_float(value):
         return None
 
 
-def franja_horaria_desde_hora(h):
-    if pd.isna(h):
-        return "-"
-    h = int(h)
-    return f"{h:02d}:00 - {h:02d}:59"
-
-
 # =========================================
 # GEOCODIFICACIÓN INVERSA
+# SOLO para puntos clave
 # =========================================
 def localidad_real(lat, lon):
     if pd.isna(lat) or pd.isna(lon):
@@ -206,7 +199,6 @@ def localidad_real(lat, lon):
             texto += f", {pais}"
 
         GEOCODE_CACHE[key] = texto
-        time.sleep(1)  # respetar rate limit básico de Nominatim
         return texto
 
     except Exception:
@@ -334,7 +326,6 @@ def detectar_detenciones(gps, gm):
             if mins >= UMBRAL_DETENCION_MIN:
                 lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
                 lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
-                loc = localidad_real(lat_m, lon_m)
                 eventos.append([
                     ini,
                     fin,
@@ -342,7 +333,6 @@ def detectar_detenciones(gps, gm):
                     lat_m,
                     lon_m,
                     aproximar_ubicacion(lat_m, lon_m),
-                    loc,
                     link_google_maps(lat_m, lon_m)
                 ])
 
@@ -357,7 +347,6 @@ def detectar_detenciones(gps, gm):
         if mins >= UMBRAL_DETENCION_MIN:
             lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
             lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
-            loc = localidad_real(lat_m, lon_m)
             eventos.append([
                 ini,
                 fin,
@@ -365,13 +354,12 @@ def detectar_detenciones(gps, gm):
                 lat_m,
                 lon_m,
                 aproximar_ubicacion(lat_m, lon_m),
-                loc,
                 link_google_maps(lat_m, lon_m)
             ])
 
     df = pd.DataFrame(eventos, columns=[
         "Inicio", "Fin", "Duración_min", "Lat", "Lon",
-        "Ubicación_aprox", "Localidad", "Google_Maps"
+        "Ubicación_aprox", "Google_Maps"
     ])
 
     if not df.empty:
@@ -397,7 +385,7 @@ def detectar_base_operativa(detenciones):
         "lon": b["Lon"],
         "duracion_min": b["Duración_min"],
         "ubicacion": b["Ubicación_aprox"],
-        "localidad": b["Localidad"],
+        "localidad": localidad_real(b["Lat"], b["Lon"]),
         "maps": link_google_maps(b["Lat"], b["Lon"])
     }
 
@@ -460,14 +448,15 @@ def reconstruir_circuitos(gps, gm, base):
             lat_prom = tramo["_lat"].mean()
             lon_prom = tramo["_lon"].mean()
 
-            localidad = localidad_real(lat_prom, lon_prom)
+            loc_centro = localidad_real(lat_prom, lon_prom)
             centro = aproximar_ubicacion(lat_prom, lon_prom)
             maps = link_google_maps(lat_prom, lon_prom)
 
-            puntos_detenidos = int((~tramo["_mov"]).sum())
+            inicio_coord = aproximar_ubicacion(tramo.iloc[0]["_lat"], tramo.iloc[0]["_lon"])
+            fin_coord = aproximar_ubicacion(tramo.iloc[-1]["_lat"], tramo.iloc[-1]["_lon"])
+
             vel_prom = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").mean(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
             vel_max = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").max(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
-
             hora_salida = pd.to_datetime(ini).hour if pd.notna(ini) else pd.NA
 
             circuitos.append([
@@ -476,10 +465,11 @@ def reconstruir_circuitos(gps, gm, base):
                 fin,
                 round(dur, 2),
                 km,
-                localidad,
+                loc_centro,
                 centro,
                 maps,
-                puntos_detenidos,
+                inicio_coord,
+                fin_coord,
                 vel_prom,
                 vel_max,
                 hora_salida,
@@ -495,10 +485,11 @@ def reconstruir_circuitos(gps, gm, base):
         "Fin",
         "Duración_min",
         "Km",
-        "Localidad",
-        "Centro_coordenado",
+        "Localidad_centro",
+        "Punto_central",
         "Google_Maps",
-        "Puntos_detenidos",
+        "Punto_inicio",
+        "Punto_final",
         "Velocidad_promedio",
         "Velocidad_máxima",
         "Hora_salida",
@@ -526,7 +517,6 @@ def clasificar_circuitos(circuitos):
         lon = r["_Lon_centro"]
         km = safe_float(r["Km"]) or 0
 
-        # firma simple basada en grid geográfico + tramo de distancia
         cell_lat = round(float(lat), 2) if lat is not None and not pd.isna(lat) else None
         cell_lon = round(float(lon), 2) if lon is not None and not pd.isna(lon) else None
 
@@ -545,7 +535,16 @@ def clasificar_circuitos(circuitos):
     freq = df["_firma"].value_counts()
 
     df["Tipo_circuito"] = df["_firma"].apply(
-        lambda f: "Habitual" if freq.get(f, 0) >= 2 else "Extraordinario"
+        lambda f: "Habitual" if freq.get(f, 0) >= 2 else "Anómalo"
+    )
+
+    df["Punto_inicio_marcado"] = df.apply(
+        lambda r: f'🔴 {r["Punto_inicio"]}' if r["Tipo_circuito"] == "Anómalo" else r["Punto_inicio"],
+        axis=1
+    )
+    df["Punto_final_marcado"] = df.apply(
+        lambda r: f'🔴 {r["Punto_final"]}' if r["Tipo_circuito"] == "Anómalo" else r["Punto_final"],
+        axis=1
     )
 
     return df
@@ -608,7 +607,6 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
 
     estados = []
     clasifs = []
-    localidades = []
 
     for _, r in merge.iterrows():
         vel = r[gv] if gv and gv in merge.columns else None
@@ -622,10 +620,8 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
         else:
             clasifs.append("Descenso brusco")
 
-        localidades.append(localidad_real(r["_lat"], r["_lon"]))
-
     merge["Ubicación_aprox"] = merge.apply(lambda r: aproximar_ubicacion(r["_lat"], r["_lon"]), axis=1)
-    merge["Localidad"] = localidades
+    merge["Localidad"] = "No calculada"
     merge["Google_Maps"] = merge.apply(lambda r: link_google_maps(r["_lat"], r["_lon"]), axis=1)
     merge["Estado_vehículo"] = estados
     merge["Clasificación"] = clasifs
@@ -674,7 +670,6 @@ def agregar_consumo_a_circuitos(circuitos, eventos_comb):
         tramo = ev[(ev["Fecha_hora"] >= ini) & (ev["Fecha_hora"] <= fin)].copy()
         consumo_desc = tramo[tramo["Variación"] < 0]["Variación"].abs().sum()
 
-        # Si no hubo cambios bruscos, queda como 0 estimado por eventos visibles
         consumo_desc = round(float(consumo_desc), 2) if pd.notna(consumo_desc) else 0.0
         eficiencia = round(consumo_desc / km, 2) if km and km > 0 else pd.NA
 
@@ -705,11 +700,9 @@ def detectar_desvios(gps, gm, base):
     if desv.empty:
         return pd.DataFrame()
 
-    localidades = [localidad_real(r["_lat"], r["_lon"]) for _, r in desv.iterrows()]
-
     out = desv[[gf, "_lat", "_lon", "_dist_base_m"]].copy()
     out["Ubicación_aprox"] = out.apply(lambda r: aproximar_ubicacion(r["_lat"], r["_lon"]), axis=1)
-    out["Localidad"] = localidades
+    out["Localidad"] = "No calculada (optimización)"
     out["Google_Maps"] = out.apply(lambda r: link_google_maps(r["_lat"], r["_lon"]), axis=1)
     out["Google_Maps"] = out["Google_Maps"].apply(
         lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
@@ -732,7 +725,6 @@ def detectar_patrones_chofer(circuitos):
 
     df = circuitos.copy()
 
-    # Clustering simple por comportamiento operativo
     def bucket_hora(h):
         if pd.isna(h):
             return "Sin horario"
@@ -794,7 +786,7 @@ def detectar_patrones_chofer(circuitos):
     texto = """
     <p>
         Se identificaron agrupaciones operativas compatibles con posibles distintos choferes o turnos.
-        Esta clasificación es inferencial y se basa en horario de salida, velocidad media y duración de circuito.
+        Esta clasificación es inferencial y se basa en horario de salida, velocidad media y duración del circuito.
     </p>
     """
 
@@ -1005,8 +997,8 @@ def index():
                         <h1>Informe Técnico de Auditoría de Flota</h1>
                         <p>
                             Análisis cruzado entre histórico GPS y sensores del vehículo.
-                            Evaluación de base operativa, localidad real, circuitos habituales,
-                            circuitos extraordinarios, combustible, desvíos y patrones de conducción.
+                            Evaluación de base operativa, circuitos, combustible, desvíos
+                            y patrones de conducción.
                         </p>
                     </div>
 
@@ -1052,18 +1044,33 @@ def index():
 
                     <div class="section">
                         <h2>3. Circuitos de trabajo</h2>
-                        {html_tabla(circuitos[[
-                            "Circuito","Inicio","Fin","Duración_min","Km","Localidad",
-                            "Tipo_circuito","Velocidad_promedio","Velocidad_máxima",
-                            "Combustible_consumido_aprox","Eficiencia_estimativa","Google_Maps"
-                        ]], index=False) if not circuitos.empty else "<p>Sin circuitos detectados.</p>"}
+                        {
+                            html_tabla(
+                                circuitos[[
+                                    "Circuito",
+                                    "Inicio",
+                                    "Fin",
+                                    "Duración_min",
+                                    "Km",
+                                    "Punto_central",
+                                    "Localidad_centro",
+                                    "Tipo_circuito",
+                                    "Punto_inicio_marcado",
+                                    "Punto_final_marcado",
+                                    "Combustible_consumido_aprox",
+                                    "Eficiencia_estimativa",
+                                    "Google_Maps"
+                                ]],
+                                index=False
+                            ) if not circuitos.empty else "<p>Sin circuitos detectados.</p>"
+                        }
                     </div>
 
                     <div class="section">
                         <h2>4. Análisis de detenciones fuera de base</h2>
                         {
                             html_tabla(
-                                det_fuera[["Inicio", "Fin", "Duración_min", "Ubicación_aprox", "Localidad", "Google_Maps", "Interpretación_operativa"]],
+                                det_fuera[["Inicio", "Fin", "Duración_min", "Ubicación_aprox", "Google_Maps", "Interpretación_operativa"]],
                                 index=False
                             ) if not det_fuera.empty else "<p>No se detectaron detenciones fuera de base relevantes.</p>"
                         }
@@ -1073,7 +1080,7 @@ def index():
                         <h2>5. Detección de desvíos</h2>
                         {
                             html_tabla(
-                                desvios[["Fecha_hora", "Distancia_a_base_m", "Ubicación_aprox", "Localidad", "Google_Maps"]],
+                                desvios[["Fecha_hora", "Distancia_a_base_m", "Ubicación_aprox", "Google_Maps"]],
                                 index=False
                             ) if not desvios.empty else "<p>No se detectaron desvíos relevantes con la configuración actual.</p>"
                         }
@@ -1220,9 +1227,8 @@ def index():
                 <h1>Auditoría técnica de flota</h1>
                 <p>
                     Plataforma de análisis cruzado entre histórico GPS y sensores.
-                    Reconstruye recorridos, identifica base operativa, localidad real,
-                    clasifica circuitos habituales y extraordinarios, analiza combustible
-                    y detecta posibles patrones de distintos choferes.
+                    Identifica base operativa, circuitos habituales y anómalos,
+                    analiza combustible y detecta patrones de conducción.
                 </p>
             </div>
 

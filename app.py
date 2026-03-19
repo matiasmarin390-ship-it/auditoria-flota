@@ -12,9 +12,15 @@ app = Flask(__name__)
 # =========================================
 UMBRAL_DETENCION_MIN = 6
 UMBRAL_CAMBIO_COMBUSTIBLE = 5.0
-DISTANCIA_BASE_METROS = 100          # una cuadra aprox
+DISTANCIA_BASE_METROS = 100
 DISTANCIA_DESVIO_METROS = 800
 VELOCIDAD_MOVIMIENTO = 3
+
+# Circuito trabajo tipo camión de basura
+DISTANCIA_MIN_CIRCUITO_METROS = 500
+VELOCIDAD_PROMEDIO_MAX_CIRCUITO = 35
+MIN_PUNTOS_DETENIDOS_CIRCUITO = 3
+
 MAX_WAYPOINTS_MAPS = 8
 
 
@@ -221,6 +227,12 @@ def texto_ubicacion(localidad, barrio):
     return ", ".join(partes) if partes else "Ubicación no disponible"
 
 
+def clasificar_punto_habitual(ubicacion, serie_ubicaciones_habituales):
+    if not ubicacion or pd.isna(ubicacion):
+        return False
+    return ubicacion in serie_ubicaciones_habituales
+
+
 # =========================================
 # PREPARACIÓN GPS
 # =========================================
@@ -352,8 +364,6 @@ def detectar_detenciones(gps, gm):
                     round(mins, 2),
                     fmt_duracion_min(mins),
                     texto_ubicacion(geo["localidad"], geo["barrio"]),
-                    geo["localidad"],
-                    geo["barrio"],
                     lat_m,
                     lon_m,
                     maps_pin_url(lat_m, lon_m)
@@ -381,15 +391,13 @@ def detectar_detenciones(gps, gm):
                 round(mins, 2),
                 fmt_duracion_min(mins),
                 texto_ubicacion(geo["localidad"], geo["barrio"]),
-                geo["localidad"],
-                geo["barrio"],
                 lat_m,
                 lon_m,
                 maps_pin_url(lat_m, lon_m)
             ])
 
     df = pd.DataFrame(eventos, columns=[
-        "Inicio", "Fin", "Duración_min", "Duración", "Ubicación", "Localidad", "Barrio",
+        "Inicio", "Fin", "Duración_min", "Duración", "Ubicación",
         "Lat", "Lon", "Google_Maps"
     ])
 
@@ -416,8 +424,6 @@ def detectar_base_operativa(detenciones):
         "lon": b["Lon"],
         "duracion_min": b["Duración_min"],
         "ubicacion": b["Ubicación"],
-        "localidad": b["Localidad"],
-        "barrio": b["Barrio"],
         "maps": maps_pin_url(b["Lat"], b["Lon"])
     }
 
@@ -426,15 +432,19 @@ def etiquetar_base(detenciones, base):
     if detenciones.empty or base is None:
         dets = detenciones.copy()
         dets["Es_base"] = False
+        dets["Distancia_base_m"] = pd.NA
         return dets
 
     flags = []
+    distancias = []
     for _, r in detenciones.iterrows():
         d = haversine_m(r["Lat"], r["Lon"], base["lat"], base["lon"])
+        distancias.append(d)
         flags.append(d is not None and d <= DISTANCIA_BASE_METROS)
 
     dets = detenciones.copy()
     dets["Es_base"] = flags
+    dets["Distancia_base_m"] = distancias
     return dets
 
 
@@ -469,58 +479,53 @@ def reconstruir_circuitos(gps, gm, base):
 
         elif not prev and act and en_circuito:
             fin_idx = i
-            nro += 1
             tramo = gps.loc[ini_idx:fin_idx].copy()
 
-            ini = tramo[fecha].min()
-            fin = tramo[fecha].max()
-            dur_min = (fin - ini).total_seconds() / 60
-            km = round(tramo["_dist_km"].sum(), 2)
-
-            lat_prom = tramo["_lat"].mean()
-            lon_prom = tramo["_lon"].mean()
-
-            texto_dir = tramo["_direccion_raw"].dropna().astype(str)
-            dir_ref = texto_dir.mode().iloc[0] if not texto_dir.empty else ""
-            geo_centro = extraer_localidad_barrio_desde_texto(dir_ref)
-            punto_central = texto_ubicacion(geo_centro["localidad"], geo_centro["barrio"])
-
-            dir_ini = str(tramo.iloc[0]["_direccion_raw"]) if pd.notna(tramo.iloc[0]["_direccion_raw"]) else ""
-            dir_fin = str(tramo.iloc[-1]["_direccion_raw"]) if pd.notna(tramo.iloc[-1]["_direccion_raw"]) else ""
-
-            geo_ini = extraer_localidad_barrio_desde_texto(dir_ini)
-            geo_fin = extraer_localidad_barrio_desde_texto(dir_fin)
-
-            punto_inicio = texto_ubicacion(geo_ini["localidad"], geo_ini["barrio"])
-            punto_final = texto_ubicacion(geo_fin["localidad"], geo_fin["barrio"])
-
-            maps_circuito = maps_route_url(tramo)
-            maps_inicio = maps_pin_url(tramo.iloc[0]["_lat"], tramo.iloc[0]["_lon"])
-            maps_final = maps_pin_url(tramo.iloc[-1]["_lat"], tramo.iloc[-1]["_lon"])
-
+            dist_m = tramo["_dist_m"].sum()
             vel_prom = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").mean(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
-            vel_max = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").max(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
-            hora_salida = pd.to_datetime(ini).hour if pd.notna(ini) else pd.NA
+            puntos_detenidos = int((~tramo["_mov"]).sum())
 
-            circuitos.append([
-                nro,
-                ini,
-                fin,
-                round(dur_min, 2),
-                fmt_duracion_min(dur_min),
-                km,
-                punto_central,
-                punto_inicio,
-                punto_final,
-                maps_circuito,
-                maps_inicio,
-                maps_final,
-                vel_prom,
-                vel_max,
-                hora_salida,
-                lat_prom,
-                lon_prom
-            ])
+            # Definición circuito tipo camión de basura
+            if (
+                dist_m >= DISTANCIA_MIN_CIRCUITO_METROS and
+                (pd.isna(vel_prom) or vel_prom <= VELOCIDAD_PROMEDIO_MAX_CIRCUITO) and
+                puntos_detenidos >= MIN_PUNTOS_DETENIDOS_CIRCUITO
+            ):
+                nro += 1
+                ini = tramo[fecha].min()
+                fin = tramo[fecha].max()
+                dur_min = (fin - ini).total_seconds() / 60
+                km = round(tramo["_dist_km"].sum(), 2)
+
+                dir_ini = str(tramo.iloc[0]["_direccion_raw"]) if pd.notna(tramo.iloc[0]["_direccion_raw"]) else "Inicio no disponible"
+                dir_fin = str(tramo.iloc[-1]["_direccion_raw"]) if pd.notna(tramo.iloc[-1]["_direccion_raw"]) else "Final no disponible"
+
+                maps_circuito = maps_route_url(tramo)
+                maps_inicio = maps_pin_url(tramo.iloc[0]["_lat"], tramo.iloc[0]["_lon"])
+                maps_final = maps_pin_url(tramo.iloc[-1]["_lat"], tramo.iloc[-1]["_lon"])
+
+                hora_salida = pd.to_datetime(ini).hour if pd.notna(ini) else pd.NA
+                lat_prom = tramo["_lat"].mean()
+                lon_prom = tramo["_lon"].mean()
+
+                circuitos.append([
+                    nro,
+                    ini,
+                    fin,
+                    round(dur_min, 2),
+                    fmt_duracion_min(dur_min),
+                    km,
+                    dir_ini,
+                    dir_fin,
+                    maps_inicio,
+                    maps_final,
+                    maps_circuito,
+                    vel_prom,
+                    puntos_detenidos,
+                    hora_salida,
+                    lat_prom,
+                    lon_prom
+                ])
 
             en_circuito = False
 
@@ -531,14 +536,13 @@ def reconstruir_circuitos(gps, gm, base):
         "Duración_min",
         "Duración",
         "Km",
-        "Punto_central",
         "Punto_inicio",
         "Punto_final",
-        "Google_Maps_Recorrido",
         "Google_Maps_Inicio",
         "Google_Maps_Final",
+        "Google_Maps_Recorrido",
         "Velocidad_promedio",
-        "Velocidad_máxima",
+        "Puntos_detenidos",
         "Hora_salida",
         "_Lat_centro",
         "_Lon_centro"
@@ -591,12 +595,8 @@ def clasificar_circuitos(circuitos):
         lambda f: "Habitual" if freq.get(f, 0) >= 2 else "Anómalo"
     )
 
-    df["Inicio_marcado"] = df.apply(
-        lambda r: f'🔴 {r["Punto_inicio"]}' if r["Tipo_circuito"] == "Anómalo" else r["Punto_inicio"],
-        axis=1
-    )
-    df["Final_marcado"] = df.apply(
-        lambda r: f'🔴 {r["Punto_final"]}' if r["Tipo_circuito"] == "Anómalo" else r["Punto_final"],
+    df["Circuito_marcado"] = df.apply(
+        lambda r: f'🔴 {int(r["Circuito"])}' if r["Tipo_circuito"] == "Anómalo" else str(int(r["Circuito"])),
         axis=1
     )
 
@@ -638,6 +638,7 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
     serie = sens[sens[col_sensor].astype(str).str.strip() == str(sensor_comb)].copy().sort_values(col_fecha)
     serie["prev_valor"] = serie[col_valor].shift(1)
     serie["delta"] = serie[col_valor] - serie["prev_valor"]
+    serie["delta_min"] = (serie[col_fecha] - serie[col_fecha].shift(1)).dt.total_seconds() / 60
 
     gf = gm["fecha"]
     gv = gm["vel"]
@@ -657,40 +658,47 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
     if eventos.empty:
         return pd.DataFrame(), sensor_comb, serie_merge
 
-    estados = []
     clasifs = []
-    ubicaciones = []
+    colores = []
+    maps = []
 
     for _, r in eventos.iterrows():
         vel = r[gv] if gv and gv in eventos.columns else None
         detenido = False if vel is None or pd.isna(vel) else vel <= VELOCIDAD_MOVIMIENTO
-        estados.append("Detenido" if detenido else "En movimiento")
 
         if r["delta"] > 0:
-            clasifs.append("Carga de combustible")
-        elif r["delta"] <= -UMBRAL_CAMBIO_COMBUSTIBLE and detenido:
-            clasifs.append("Anómalo - posible robo / extracción")
+            clasifs.append("🟢 Carga de combustible")
+            colores.append("verde")
         else:
-            clasifs.append("Consumo / descenso operativo")
+            if detenido:
+                if pd.notna(r["delta_min"]) and r["delta_min"] <= 15:
+                    clasifs.append("🔴 Posible robo de combustible")
+                    colores.append("rojo")
+                else:
+                    clasifs.append("🟠 Duda / revisar")
+                    colores.append("naranja")
+            else:
+                clasifs.append(None)
+                colores.append(None)
 
-        geo = extraer_localidad_barrio_desde_texto(r["_direccion_raw"])
-        ubicaciones.append(texto_ubicacion(geo["localidad"], geo["barrio"]))
+        maps.append(maps_pin_url(r["_lat"], r["_lon"]))
 
-    eventos["Ubicación"] = ubicaciones
-    eventos["Google_Maps"] = eventos.apply(lambda r: maps_pin_url(r["_lat"], r["_lon"]), axis=1)
-    eventos["Estado_vehículo"] = estados
     eventos["Clasificación"] = clasifs
+    eventos["Color"] = colores
+    eventos["Google_Maps"] = maps
+
+    eventos = eventos[eventos["Clasificación"].notna()].copy()
+    if eventos.empty:
+        return pd.DataFrame(), sensor_comb, serie_merge
 
     out = eventos[[
         col_fecha, "prev_valor", col_valor, "delta",
-        "Ubicación", "Google_Maps",
-        "Estado_vehículo", "Clasificación"
+        "Google_Maps", "Clasificación"
     ]].copy()
 
     out.columns = [
         "Fecha_hora", "Nivel_antes", "Nivel_después", "Variación",
-        "Ubicación", "Google_Maps",
-        "Estado_vehículo", "Clasificación"
+        "Google_Maps", "Clasificación"
     ]
 
     out["Google_Maps"] = out["Google_Maps"].apply(
@@ -708,14 +716,12 @@ def agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm):
 
     if serie_comb_merge is None or serie_comb_merge.empty:
         df["Combustible_consumido_aprox"] = pd.NA
-        df["Eficiencia_estimativa"] = pd.NA
         return df
 
     col_fecha = sm["fecha"]
     col_valor = sm["valor"]
 
     consumos = []
-    eficiencias = []
 
     base = serie_comb_merge.copy()
     base[col_fecha] = pd.to_datetime(base[col_fecha], errors="coerce")
@@ -724,7 +730,6 @@ def agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm):
     for _, c in df.iterrows():
         ini = pd.to_datetime(c["Inicio"], errors="coerce")
         fin = pd.to_datetime(c["Fin"], errors="coerce")
-        km = safe_float(c["Km"])
 
         tramo = base[(base[col_fecha] >= ini) & (base[col_fecha] <= fin)].copy()
 
@@ -736,20 +741,16 @@ def agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm):
                 diff = float(inicio_val) - float(fin_val)
                 consumo = round(diff, 2) if diff > 0 else 0.0
 
-        eficiencia = round(consumo / km, 2) if km and km > 0 else pd.NA
-
         consumos.append(consumo)
-        eficiencias.append(eficiencia)
 
     df["Combustible_consumido_aprox"] = consumos
-    df["Eficiencia_estimativa"] = eficiencias
     return df
 
 
 # =========================================
 # DESVÍOS
 # =========================================
-def detectar_desvios(gps, gm, base):
+def detectar_desvios(gps, gm, base, circuitos):
     if base is None or gps.empty:
         return pd.DataFrame()
 
@@ -761,23 +762,63 @@ def detectar_desvios(gps, gm, base):
         axis=1
     )
 
-    desv = gps[gps["_dist_base_m"] > DISTANCIA_DESVIO_METROS].copy()
-    if desv.empty:
-        return pd.DataFrame()
+    # puntos habituales por direcciones de circuitos habituales
+    habituales = set()
+    if not circuitos.empty:
+        circ_hab = circuitos[circuitos["Tipo_circuito"] == "Habitual"]
+        for _, r in circ_hab.iterrows():
+            if pd.notna(r["Punto_inicio"]):
+                habituales.add(str(r["Punto_inicio"]).strip())
+            if pd.notna(r["Punto_final"]):
+                habituales.add(str(r["Punto_final"]).strip())
 
-    out = desv[[gf, "_lat", "_lon", "_dist_base_m", "_direccion_raw"]].copy()
-    out["Ubicación"] = out["_direccion_raw"].astype(str).replace("nan", "Ubicación no disponible")
-    out["Google_Maps"] = out.apply(lambda r: maps_pin_url(r["_lat"], r["_lon"]), axis=1)
-    out["Google_Maps"] = out["Google_Maps"].apply(
-        lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
-    )
+    gps["_ubicacion_texto"] = gps["_direccion_raw"].astype(str).replace("nan", "").str.strip()
+    gps["_punto_habitual"] = gps["_ubicacion_texto"].apply(lambda x: x in habituales if x else False)
 
-    out.rename(columns={
-        gf: "Fecha_hora",
-        "_dist_base_m": "Distancia_a_base_m"
-    }, inplace=True)
+    eventos = []
+    en_det = False
+    ini_idx = None
 
-    return out.head(50)
+    for i, row in gps.iterrows():
+        detenido = not bool(row["_mov"])
+
+        if detenido and not en_det:
+            en_det = True
+            ini_idx = i
+
+        elif not detenido and en_det:
+            fin_idx = i - 1
+            tramo = gps.loc[ini_idx:fin_idx].copy()
+            mins = (tramo[gf].max() - tramo[gf].min()).total_seconds() / 60
+
+            if mins > UMBRAL_DETENCION_MIN:
+                lat_m = tramo["_lat"].mean()
+                lon_m = tramo["_lon"].mean()
+                dist_base_km = round((haversine_m(lat_m, lon_m, base["lat"], base["lon"]) or 0) / 1000, 2)
+                ubic = tramo["_ubicacion_texto"].mode().iloc[0] if not tramo["_ubicacion_texto"].dropna().empty else "Ubicación no disponible"
+                habitual = ubic in habituales if ubic else False
+
+                if not habitual:
+                    eventos.append([
+                        tramo[gf].min(),
+                        ubic,
+                        dist_base_km,
+                        fmt_duracion_min(mins),
+                        maps_pin_url(lat_m, lon_m)
+                    ])
+
+            en_det = False
+
+    df = pd.DataFrame(eventos, columns=[
+        "Fecha_hora", "Ubicación", "Distancia_base_km", "Tiempo_detenido", "Google_Maps"
+    ])
+
+    if not df.empty:
+        df["Google_Maps"] = df["Google_Maps"].apply(
+            lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
+        )
+
+    return df
 
 
 # =========================================
@@ -791,24 +832,20 @@ def filtrar_detenciones_fuera_de_base(det_fuera, circuitos):
     if not circuitos.empty:
         habituales = circuitos[circuitos["Tipo_circuito"] == "Habitual"].copy()
 
+    ubic_habituales = set()
+    for _, c in habituales.iterrows():
+        ubic_habituales.add(str(c["Punto_inicio"]).strip())
+        ubic_habituales.add(str(c["Punto_final"]).strip())
+
     rows = []
     for _, det in det_fuera.iterrows():
         if det["Duración_min"] <= UMBRAL_DETENCION_MIN:
             continue
 
-        pertenece_habitual = False
-        for _, c in habituales.iterrows():
-            ini = pd.to_datetime(c["Inicio"])
-            fin = pd.to_datetime(c["Fin"])
-            det_ini = pd.to_datetime(det["Inicio"])
-            det_fin = pd.to_datetime(det["Fin"])
+        if str(det["Ubicación"]).strip() in ubic_habituales:
+            continue
 
-            if det_ini >= ini and det_fin <= fin:
-                pertenece_habitual = True
-                break
-
-        if not pertenece_habitual:
-            rows.append(det)
+        rows.append(det)
 
     if not rows:
         return pd.DataFrame(columns=det_fuera.columns)
@@ -960,9 +997,8 @@ def index():
             det_fuera = filtrar_detenciones_fuera_de_base(det_fuera, circuitos)
 
             if not det_fuera.empty:
-                det_fuera["Interpretación_operativa"] = det_fuera["Duración_min"].apply(
-                    lambda x: "Detención fuera de base no habitual" if x > UMBRAL_DETENCION_MIN else "No relevante"
-                )
+                det_fuera["Habitual"] = "No"
+                det_fuera["Interpretación_operativa"] = "Detención fuera de base no habitual"
 
             eventos_comb, sensor_comb, serie_comb_merge = detectar_eventos_combustible(sens, sm, gps, gm)
 
@@ -976,15 +1012,13 @@ def index():
 
             circuitos = agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm)
 
-            desvios = detectar_desvios(gps, gm, base)
+            desvios = detectar_desvios(gps, gm, base, circuitos)
 
             patrones_texto, patrones_df = detectar_patrones_chofer(circuitos)
 
             if base:
                 base_html = (
-                    f'<p><b>Ubicación:</b> {escape(texto_ubicacion(base["localidad"], base["barrio"]))}</p>'
-                    f'<p><b>Localidad:</b> {escape(base["localidad"])}</p>'
-                    f'<p><b>Barrio:</b> {escape(base["barrio"])}</p>'
+                    f'<p><b>Ubicación:</b> {escape(base["ubicacion"])}</p>'
                     f'<p><b>Duración de permanencia:</b> {fmt_duracion_min(base["duracion_min"])}</p>'
                     f'<p><b>Ver en Google Maps:</b> <a href="{base["maps"]}" target="_blank">Abrir ubicación</a></p>'
                 )
@@ -1155,17 +1189,15 @@ def index():
                         {
                             html_tabla(
                                 circuitos[[
-                                    "Circuito",
+                                    "Circuito_marcado",
                                     "Inicio",
                                     "Fin",
                                     "Duración",
                                     "Km",
-                                    "Punto_central",
                                     "Tipo_circuito",
-                                    "Inicio_marcado",
-                                    "Final_marcado",
+                                    "Punto_inicio",
+                                    "Punto_final",
                                     "Combustible_consumido_aprox",
-                                    "Eficiencia_estimativa",
                                     "Google_Maps_Inicio",
                                     "Google_Maps_Final",
                                     "Google_Maps_Recorrido"
@@ -1179,7 +1211,7 @@ def index():
                         <h2>4. Análisis de detenciones fuera de base</h2>
                         {
                             html_tabla(
-                                det_fuera[["Inicio", "Fin", "Duración", "Ubicación", "Google_Maps", "Interpretación_operativa"]],
+                                det_fuera[["Inicio", "Fin", "Duración", "Google_Maps", "Habitual", "Interpretación_operativa"]],
                                 index=False
                             ) if not det_fuera.empty else "<p>No se detectaron detenciones fuera de base relevantes.</p>"
                         }
@@ -1189,7 +1221,7 @@ def index():
                         <h2>5. Detección de desvíos</h2>
                         {
                             html_tabla(
-                                desvios[["Fecha_hora", "Distancia_a_base_m", "Ubicación", "Google_Maps"]],
+                                desvios[["Fecha_hora", "Ubicación", "Distancia_base_km", "Tiempo_detenido", "Google_Maps"]],
                                 index=False
                             ) if not desvios.empty else "<p>No se detectaron desvíos relevantes con la configuración actual.</p>"
                         }
@@ -1198,7 +1230,7 @@ def index():
                     <div class="section">
                         <h2>6. Auditoría de combustible</h2>
                         <p><b>Sensor utilizado:</b> {escape(str(sensor_comb)) if sensor_comb else "No detectado"}</p>
-                        {html_tabla(eventos_comb, index=False) if not eventos_comb.empty else "<p>No se detectaron eventos de combustible mayores al 5%.</p>"}
+                        {html_tabla(eventos_comb, index=False) if not eventos_comb.empty else "<p>No se detectaron eventos de combustible relevantes.</p>"}
                     </div>
 
                     <div class="section">
@@ -1371,5 +1403,7 @@ def index():
     </body>
     </html>
     '''
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

@@ -3,6 +3,7 @@ import pandas as pd
 import io
 import math
 import uuid
+import json
 from html import escape
 from urllib.parse import urlencode
 
@@ -19,23 +20,17 @@ app = Flask(__name__)
 # =========================================
 UMBRAL_DETENCION_MIN = 6
 UMBRAL_CAMBIO_COMBUSTIBLE = 5.0
-DISTANCIA_BASE_METROS = 100            # una cuadra aprox.
-DISTANCIA_DESVIO_METROS = 1000         # desvíos > 1 km
-VELOCIDAD_MOVIMIENTO = 3               # km/h
+DISTANCIA_BASE_METROS = 100
+DISTANCIA_DESVIO_METROS = 1000
+VELOCIDAD_MOVIMIENTO = 3
 
-# Circuito tipo camión de basura
 DISTANCIA_MIN_CIRCUITO_METROS = 500
 VELOCIDAD_PROMEDIO_MAX_CIRCUITO = 35
 MIN_PUNTOS_DETENIDOS_CIRCUITO = 3
 
-# Google Maps
 MAX_WAYPOINTS_MAPS = 8
-
-# Combustible
-UMBRAL_NO_MOVIMIENTO_METROS = 30
 UMBRAL_DETENCION_COMBUSTIBLE_MIN = 6
 
-# Cache temporal para PDF
 REPORT_CACHE = {}
 
 
@@ -116,6 +111,12 @@ def fmt_fecha(x):
     if pd.isna(x):
         return "-"
     return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_fecha_dia(x):
+    if pd.isna(x):
+        return "-"
+    return pd.to_datetime(x).strftime("%Y-%m-%d")
 
 
 def fmt_duracion_min(mins):
@@ -209,29 +210,6 @@ def maps_route_url(points_df):
         params["waypoints"] = "|".join(waypoints)
 
     return "https://www.google.com/maps/dir/?" + urlencode(params, safe="|,:")
-
-
-def extraer_localidad_barrio_desde_texto(texto):
-    if pd.isna(texto):
-        return {"localidad": "Localidad no disponible", "barrio": "Barrio no disponible"}
-
-    t = str(texto).strip()
-    if not t:
-        return {"localidad": "Localidad no disponible", "barrio": "Barrio no disponible"}
-
-    partes = [p.strip() for p in t.split(",") if p.strip()]
-
-    barrio = "Barrio no disponible"
-    localidad = "Localidad no disponible"
-
-    if len(partes) >= 1:
-        barrio = partes[0]
-    if len(partes) >= 2:
-        localidad = partes[1]
-    elif len(partes) == 1:
-        localidad = partes[0]
-
-    return {"localidad": localidad, "barrio": barrio}
 
 
 def row_to_pdf_table(df):
@@ -508,10 +486,13 @@ def reconstruir_circuitos(gps, gm, base):
                 lat_prom = tramo["_lat"].mean()
                 lon_prom = tramo["_lon"].mean()
 
+                direccion_grafico = f"{dir_ini} → {dir_fin}"
+
                 circuitos.append([
                     nro, ini, fin, round(dur_min, 2), fmt_duracion_min(dur_min), km,
                     dir_ini, dir_fin, maps_inicio, maps_final, maps_circuito,
-                    vel_prom, puntos_detenidos, hora_salida, lat_prom, lon_prom
+                    vel_prom, puntos_detenidos, hora_salida, lat_prom, lon_prom,
+                    fmt_fecha_dia(ini), direccion_grafico
                 ])
 
             en_circuito = False
@@ -521,7 +502,8 @@ def reconstruir_circuitos(gps, gm, base):
         "Punto_inicio", "Punto_final",
         "Google_Maps_Inicio", "Google_Maps_Final", "Google_Maps_Recorrido",
         "Velocidad_promedio", "Puntos_detenidos", "Hora_salida",
-        "_Lat_centro", "_Lon_centro"
+        "_Lat_centro", "_Lon_centro",
+        "Día", "Dirección_grafico"
     ])
 
     if not df.empty:
@@ -1043,22 +1025,14 @@ def index():
 
             eventos_comb, sensor_comb, serie_comb_merge = detectar_eventos_combustible(sens, sm, gps, gm)
 
-            consumo_total = "No disponible"
-            if serie_comb_merge is not None and not serie_comb_merge.empty:
-                col_valor = sm["valor"]
-                serie_tmp = pd.to_numeric(serie_comb_merge[col_valor], errors="coerce").dropna()
-                if len(serie_tmp) >= 2:
-                    diff_total = float(serie_tmp.iloc[0]) - float(serie_tmp.iloc[-1])
-                    consumo_total = round(diff_total, 2) if diff_total > 0 else 0.0
-
             desvios = detectar_desvios(gps, gm, base, circuitos)
             patrones_texto, patrones_df = detectar_patrones_chofer(circuitos)
 
             if base:
                 base_html = (
                     f'<div class="callout">'
-                    f'<div><span class="label-mini">DIRECCIÓN BASE</span><br>{escape(str(base["direccion"]))}</div>'
-                    f'<div style="margin-top:8px;"><span class="label-mini">PERMANENCIA</span><br>{fmt_duracion_min(base["duracion_min"])}</div>'
+                    f'<div class="base-address">{escape(str(base["direccion"]))}</div>'
+                    f'<div class="base-meta">PERMANENCIA IDENTIFICADA: {fmt_duracion_min(base["duracion_min"])}</div>'
                     f'<div style="margin-top:10px;"><a href="{base["maps"]}" target="_blank">Abrir ubicación en Google Maps</a></div>'
                     f'</div>'
                 )
@@ -1067,7 +1041,6 @@ def index():
 
             circuitos_html = circuitos[[
                 "Circuito", "Inicio", "Fin", "Duración", "Km", "Tipo_circuito",
-                "Punto_inicio", "Punto_final",
                 "Google_Maps_Inicio", "Google_Maps_Final", "Google_Maps_Recorrido"
             ]].copy() if not circuitos.empty else pd.DataFrame()
 
@@ -1084,29 +1057,42 @@ def index():
                 "Duración_evento", "Google_Maps", "Clasificación"
             ]].copy() if not eventos_comb.empty else pd.DataFrame()
 
+            circuitos_chart = []
+            if not circuitos.empty:
+                chart_df = circuitos[["Día", "Dirección_grafico", "Km"]].copy()
+                for _, r in chart_df.iterrows():
+                    label = f'{r["Día"]} | {r["Dirección_grafico"]}'
+                    circuitos_chart.append({
+                        "label": label,
+                        "km": float(r["Km"]) if pd.notna(r["Km"]) else 0
+                    })
+
             report_id = str(uuid.uuid4())
 
             base_pdf = pd.DataFrame([{
-                "Dirección base": str(base["direccion"]) if base else "No disponible",
+                "Base operativa": str(base["direccion"]) if base else "No disponible",
                 "Duración de permanencia": fmt_duracion_min(base["duracion_min"]) if base else "No disponible"
             }])
 
-            circuitos_pdf = circuitos_html.copy() if not circuitos_html.empty else pd.DataFrame()
-            for col in ["Google_Maps_Inicio", "Google_Maps_Final", "Google_Maps_Recorrido"]:
-                if col in circuitos_pdf.columns:
-                    circuitos_pdf.drop(columns=[col], inplace=True)
+            circuitos_pdf = circuitos.copy() if not circuitos.empty else pd.DataFrame()
+            if not circuitos_pdf.empty:
+                keep_cols = ["Circuito", "Inicio", "Fin", "Duración", "Km", "Tipo_circuito", "Punto_inicio", "Punto_final"]
+                circuitos_pdf = circuitos_pdf[keep_cols]
 
-            detenciones_pdf = det_fuera_html.copy() if not det_fuera_html.empty else pd.DataFrame()
-            if "Google_Maps" in detenciones_pdf.columns:
-                detenciones_pdf.drop(columns=["Google_Maps"], inplace=True)
+            detenciones_pdf = det_fuera.copy() if not det_fuera.empty else pd.DataFrame()
+            if not detenciones_pdf.empty:
+                keep_cols = ["Inicio", "Fin", "Duración", "Dirección", "Habitual", "Interpretación_operativa"]
+                detenciones_pdf = detenciones_pdf[keep_cols]
 
-            desvios_pdf = desvios_html.copy() if not desvios_html.empty else pd.DataFrame()
-            if "Google_Maps" in desvios_pdf.columns:
-                desvios_pdf.drop(columns=["Google_Maps"], inplace=True)
+            desvios_pdf = desvios.copy() if not desvios.empty else pd.DataFrame()
+            if not desvios_pdf.empty:
+                keep_cols = ["Fecha_hora", "Distancia_base_km", "Tiempo_detenido"]
+                desvios_pdf = desvios_pdf[keep_cols]
 
-            combustible_pdf = combustible_html.copy() if not combustible_html.empty else pd.DataFrame()
-            if "Google_Maps" in combustible_pdf.columns:
-                combustible_pdf.drop(columns=["Google_Maps"], inplace=True)
+            combustible_pdf = eventos_comb.copy() if not eventos_comb.empty else pd.DataFrame()
+            if not combustible_pdf.empty:
+                keep_cols = ["Fecha_hora", "Nivel_antes", "Nivel_después", "Variación", "Duración_evento", "Clasificación"]
+                combustible_pdf = combustible_pdf[keep_cols]
 
             REPORT_CACHE[report_id] = {
                 "subtitle": "Resumen ejecutivo de auditoría técnica de flota.",
@@ -1116,7 +1102,6 @@ def index():
                     "Velocidad máxima": vel_max,
                     "Tiempo en movimiento": tiempo_mov,
                     "Tiempo detenido": fmt_duracion_min(tiempo_det),
-                    "Consumo total de combustible": consumo_total,
                 },
                 "base": base_pdf,
                 "circuitos": circuitos_pdf,
@@ -1126,11 +1111,14 @@ def index():
                 "patrones": patrones_df if not patrones_df.empty else "Sin patrones suficientes."
             }
 
+            chart_json = json.dumps(circuitos_chart, ensure_ascii=False)
+
             html = f"""
             <html>
             <head>
                 <meta charset="utf-8">
                 <title>Informe de Auditoría de Flota</title>
+                <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
                 <style>
                     * {{ box-sizing: border-box; }}
 
@@ -1150,10 +1138,11 @@ def index():
                     .hero {{
                         background: linear-gradient(135deg, #0f2d46, #1e4d73);
                         color: white;
-                        border-radius: 24px;
+                        border-radius: 34px;
                         padding: 34px;
                         margin-bottom: 24px;
                         box-shadow: 0 18px 44px rgba(15, 23, 42, 0.18);
+                        text-align: center;
                     }}
 
                     .hero h1 {{
@@ -1161,6 +1150,7 @@ def index():
                         font-size: 32px;
                         font-weight: 800;
                         letter-spacing: 0.02em;
+                        text-align: center;
                     }}
 
                     .hero p {{
@@ -1168,11 +1158,12 @@ def index():
                         line-height: 1.6;
                         font-size: 15px;
                         opacity: 0.95;
+                        text-align: center;
                     }}
 
                     .summary-grid {{
                         display: grid;
-                        grid-template-columns: repeat(4, 1fr);
+                        grid-template-columns: repeat(3, 1fr);
                         gap: 18px;
                         margin-bottom: 26px;
                     }}
@@ -1180,8 +1171,8 @@ def index():
                     .metric {{
                         background: rgba(255,255,255,0.92);
                         backdrop-filter: blur(6px);
-                        border-radius: 20px;
-                        padding: 20px;
+                        border-radius: 28px;
+                        padding: 24px;
                         border: 1px solid rgba(203, 213, 225, 0.7);
                         box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
                     }}
@@ -1204,8 +1195,8 @@ def index():
                     .section {{
                         background: rgba(255,255,255,0.96);
                         backdrop-filter: blur(8px);
-                        border-radius: 24px;
-                        padding: 26px;
+                        border-radius: 28px;
+                        padding: 28px;
                         margin-bottom: 22px;
                         border: 1px solid rgba(226, 232, 240, 0.85);
                         box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
@@ -1228,18 +1219,42 @@ def index():
                         background: linear-gradient(180deg, #eef6ff 0%, #f8fbff 100%);
                         border: 1px solid #cfe0f5;
                         border-left: 6px solid #2563eb;
-                        padding: 16px 18px;
-                        border-radius: 14px;
+                        padding: 18px 20px;
+                        border-radius: 16px;
                         line-height: 1.7;
                         color: #16324a;
                     }}
 
-                    .label-mini {{
-                        font-size: 11px;
-                        color: #64748b;
-                        text-transform: uppercase;
-                        letter-spacing: .08em;
+                    .base-address {{
+                        font-size: 18px;
                         font-weight: 700;
+                        color: #16324a;
+                    }}
+
+                    .base-meta {{
+                        margin-top: 8px;
+                        font-size: 14px;
+                        color: #52637a;
+                        text-transform: uppercase;
+                        letter-spacing: .04em;
+                        font-weight: 700;
+                    }}
+
+                    .chart-card {{
+                        background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
+                        border: 1px solid #dbe7f3;
+                        border-radius: 18px;
+                        padding: 18px;
+                        margin-bottom: 18px;
+                    }}
+
+                    .chart-title {{
+                        font-size: 14px;
+                        font-weight: 800;
+                        text-transform: uppercase;
+                        letter-spacing: .05em;
+                        color: #1f4e74;
+                        margin-bottom: 12px;
                     }}
 
                     table.report-table {{
@@ -1318,15 +1333,11 @@ def index():
 
                     @media (max-width: 980px) {{
                         .summary-grid {{
-                            grid-template-columns: repeat(2, 1fr);
+                            grid-template-columns: 1fr;
                         }}
                     }}
 
                     @media (max-width: 640px) {{
-                        .summary-grid {{
-                            grid-template-columns: 1fr;
-                        }}
-
                         .section h2 {{
                             font-size: 22px;
                         }}
@@ -1356,10 +1367,6 @@ def index():
                             <div class="label">TIEMPO EN MOVIMIENTO</div>
                             <div class="value" style="font-size:20px;">{tiempo_mov}</div>
                         </div>
-                        <div class="metric">
-                            <div class="label">CONSUMO TOTAL</div>
-                            <div class="value">{consumo_total}</div>
-                        </div>
                     </div>
 
                     <div class="section">
@@ -1369,6 +1376,10 @@ def index():
 
                     <div class="section">
                         <h2>CIRCUITOS DE TRABAJO</h2>
+                        <div class="chart-card">
+                            <div class="chart-title">GRÁFICO DIARIO DE DIRECCIÓN Y KM RECORRIDOS</div>
+                            <canvas id="circuitosChart" height="120"></canvas>
+                        </div>
                         {html_tabla(circuitos_html, index=False) if not circuitos_html.empty else '<p class="empty-text">Sin circuitos detectados.</p>'}
                     </div>
 
@@ -1399,6 +1410,52 @@ def index():
                         <a class="btn secondary" href="/">NUEVA AUDITORÍA</a>
                     </div>
                 </div>
+
+                <script>
+                    const circuitosData = {chart_json};
+                    const ctx = document.getElementById('circuitosChart');
+
+                    if (ctx && circuitosData.length > 0) {{
+                        new Chart(ctx, {{
+                            type: 'bar',
+                            data: {{
+                                labels: circuitosData.map(x => x.label),
+                                datasets: [{{
+                                    label: 'KM RECORRIDOS',
+                                    data: circuitosData.map(x => x.km),
+                                    backgroundColor: 'rgba(31, 78, 116, 0.85)',
+                                    borderColor: 'rgba(15, 45, 70, 1)',
+                                    borderWidth: 1,
+                                    borderRadius: 8
+                                }}]
+                            }},
+                            options: {{
+                                responsive: true,
+                                maintainAspectRatio: false,
+                                plugins: {{
+                                    legend: {{
+                                        display: true
+                                    }}
+                                }},
+                                scales: {{
+                                    x: {{
+                                        ticks: {{
+                                            maxRotation: 70,
+                                            minRotation: 70
+                                        }}
+                                    }},
+                                    y: {{
+                                        beginAtZero: true,
+                                        title: {{
+                                            display: true,
+                                            text: 'KM'
+                                        }}
+                                    }}
+                                }}
+                            }}
+                        }});
+                    }}
+                </script>
             </body>
             </html>
             """
@@ -1440,10 +1497,11 @@ def index():
             .hero {
                 background: linear-gradient(135deg, #0f2d46, #1e4d73);
                 color: white;
-                border-radius: 24px;
+                border-radius: 34px;
                 padding: 34px;
                 margin-bottom: 24px;
                 box-shadow: 0 18px 44px rgba(15, 23, 42, 0.18);
+                text-align: center;
             }
 
             .hero h1 {
@@ -1451,6 +1509,7 @@ def index():
                 font-size: 32px;
                 font-weight: 800;
                 letter-spacing: 0.02em;
+                text-align: center;
             }
 
             .hero p {
@@ -1458,11 +1517,12 @@ def index():
                 line-height: 1.6;
                 font-size: 15px;
                 opacity: 0.95;
+                text-align: center;
             }
 
             .card {
                 background: rgba(255,255,255,0.96);
-                border-radius: 24px;
+                border-radius: 28px;
                 padding: 28px;
                 box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
                 border: 1px solid rgba(226, 232, 240, 0.85);

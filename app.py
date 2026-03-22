@@ -1,9 +1,18 @@
-from flask import Flask, request
+from flask import Flask, request, send_file, abort
 import pandas as pd
 import io
 import math
+import uuid
 from html import escape
 from urllib.parse import urlencode
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+)
 
 app = Flask(__name__)
 
@@ -13,15 +22,18 @@ app = Flask(__name__)
 UMBRAL_DETENCION_MIN = 6
 UMBRAL_CAMBIO_COMBUSTIBLE = 5.0
 DISTANCIA_BASE_METROS = 100
-DISTANCIA_DESVIO_METROS = 800
+DISTANCIA_DESVIO_METROS = 1000
 VELOCIDAD_MOVIMIENTO = 3
 
-# Circuito trabajo tipo camión de basura
 DISTANCIA_MIN_CIRCUITO_METROS = 500
 VELOCIDAD_PROMEDIO_MAX_CIRCUITO = 35
 MIN_PUNTOS_DETENIDOS_CIRCUITO = 3
 
 MAX_WAYPOINTS_MAPS = 8
+UMBRAL_NO_MOVIMIENTO_METROS = 30
+UMBRAL_DETENCION_COMBUSTIBLE_MIN = 6
+
+REPORT_CACHE = {}
 
 
 # =========================================
@@ -115,7 +127,7 @@ def fmt_duracion_min(mins):
 def html_tabla(df, index=False):
     if df is None or df.empty:
         return "<p>Sin datos.</p>"
-    return df.to_html(index=index, border=1, escape=False)
+    return df.to_html(index=index, border=0, escape=False, classes="report-table")
 
 
 def safe_float(value):
@@ -188,7 +200,6 @@ def maps_route_url(points_df):
         "destination": destination,
         "travelmode": "driving"
     }
-
     if waypoints:
         params["waypoints"] = "|".join(waypoints)
 
@@ -227,10 +238,13 @@ def texto_ubicacion(localidad, barrio):
     return ", ".join(partes) if partes else "Ubicación no disponible"
 
 
-def clasificar_punto_habitual(ubicacion, serie_ubicaciones_habituales):
-    if not ubicacion or pd.isna(ubicacion):
-        return False
-    return ubicacion in serie_ubicaciones_habituales
+def row_to_pdf_table(df):
+    if df is None or df.empty:
+        return [["Sin datos"]]
+    data = [list(df.columns)]
+    for _, row in df.iterrows():
+        data.append([str("" if pd.isna(v) else v) for v in row.tolist()])
+    return data
 
 
 # =========================================
@@ -262,9 +276,7 @@ def preparar_gps(df):
         col_lon = buscar_columna(df, ["longitud", "longitude", "lon", "lng"])
 
         if not col_lat or not col_lon:
-            raise Exception(
-                f"El archivo GPS debe tener fecha y coordenadas válidas. Detectadas: {list(df.columns)}"
-            )
+            raise Exception(f"El archivo GPS debe tener fecha y coordenadas válidas. Detectadas: {list(df.columns)}")
 
         gps["_lat"] = pd.to_numeric(gps[col_lat], errors="coerce")
         gps["_lon"] = pd.to_numeric(gps[col_lon], errors="coerce")
@@ -310,9 +322,7 @@ def preparar_sensores(df):
     col_valor = buscar_columna(df, ["valor", "value"])
 
     if not col_sensor or not col_fecha or not col_valor:
-        raise Exception(
-            f"El archivo de sensores debe contener Sensor, Fecha y Valor. Detectadas: {list(df.columns)}"
-        )
+        raise Exception(f"El archivo de sensores debe contener Sensor, Fecha y Valor. Detectadas: {list(df.columns)}")
 
     s = df.copy()
     s[col_sensor] = s[col_sensor].astype(str).str.strip()
@@ -332,7 +342,6 @@ def preparar_sensores(df):
 # =========================================
 def detectar_detenciones(gps, gm):
     fecha = gm["fecha"]
-
     eventos = []
     en_det = False
     ini_idx = None
@@ -343,7 +352,6 @@ def detectar_detenciones(gps, gm):
         if detenido and not en_det:
             en_det = True
             ini_idx = i
-
         elif not detenido and en_det:
             fin_idx = i - 1
             ini = gps.loc[ini_idx, fecha]
@@ -353,22 +361,10 @@ def detectar_detenciones(gps, gm):
             if mins >= UMBRAL_DETENCION_MIN:
                 lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
                 lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
-
-                texto_dir = gps.loc[ini_idx:fin_idx, "_direccion_raw"].dropna().astype(str)
-                dir_ref = texto_dir.mode().iloc[0] if not texto_dir.empty else ""
-                geo = extraer_localidad_barrio_desde_texto(dir_ref)
-
                 eventos.append([
-                    ini,
-                    fin,
-                    round(mins, 2),
-                    fmt_duracion_min(mins),
-                    texto_ubicacion(geo["localidad"], geo["barrio"]),
-                    lat_m,
-                    lon_m,
-                    maps_pin_url(lat_m, lon_m)
+                    ini, fin, round(mins, 2), fmt_duracion_min(mins),
+                    lat_m, lon_m, maps_pin_url(lat_m, lon_m)
                 ])
-
             en_det = False
 
     if en_det and ini_idx is not None:
@@ -376,28 +372,16 @@ def detectar_detenciones(gps, gm):
         ini = gps.loc[ini_idx, fecha]
         fin = gps.loc[fin_idx, fecha]
         mins = (fin - ini).total_seconds() / 60
-
         if mins >= UMBRAL_DETENCION_MIN:
             lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
             lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
-
-            texto_dir = gps.loc[ini_idx:fin_idx, "_direccion_raw"].dropna().astype(str)
-            dir_ref = texto_dir.mode().iloc[0] if not texto_dir.empty else ""
-            geo = extraer_localidad_barrio_desde_texto(dir_ref)
-
             eventos.append([
-                ini,
-                fin,
-                round(mins, 2),
-                fmt_duracion_min(mins),
-                texto_ubicacion(geo["localidad"], geo["barrio"]),
-                lat_m,
-                lon_m,
-                maps_pin_url(lat_m, lon_m)
+                ini, fin, round(mins, 2), fmt_duracion_min(mins),
+                lat_m, lon_m, maps_pin_url(lat_m, lon_m)
             ])
 
     df = pd.DataFrame(eventos, columns=[
-        "Inicio", "Fin", "Duración_min", "Duración", "Ubicación",
+        "Inicio", "Fin", "Duración_min", "Duración",
         "Lat", "Lon", "Google_Maps"
     ])
 
@@ -405,25 +389,33 @@ def detectar_detenciones(gps, gm):
         df["Google_Maps"] = df["Google_Maps"].apply(
             lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
         )
-
     return df
 
 
 # =========================================
 # BASE OPERATIVA
 # =========================================
-def detectar_base_operativa(detenciones):
+def detectar_base_operativa(detenciones, gps):
     if detenciones.empty:
-        return None
+        # fallback por cluster simple en gps detenido
+        quietos = gps[~gps["_mov"]].copy()
+        if quietos.empty:
+            return None
+        lat = quietos["_lat"].mean()
+        lon = quietos["_lon"].mean()
+        return {
+            "lat": lat,
+            "lon": lon,
+            "duracion_min": 0,
+            "maps": maps_pin_url(lat, lon)
+        }
 
     dets = detenciones.sort_values("Duración_min", ascending=False).reset_index(drop=True)
     b = dets.iloc[0]
-
     return {
         "lat": b["Lat"],
         "lon": b["Lon"],
         "duracion_min": b["Duración_min"],
-        "ubicacion": b["Ubicación"],
         "maps": maps_pin_url(b["Lat"], b["Lon"])
     }
 
@@ -453,7 +445,6 @@ def etiquetar_base(detenciones, base):
 # =========================================
 def reconstruir_circuitos(gps, gm, base):
     fecha = gm["fecha"]
-
     if base is None:
         return pd.DataFrame()
 
@@ -485,7 +476,6 @@ def reconstruir_circuitos(gps, gm, base):
             vel_prom = round(pd.to_numeric(tramo[gm["vel"]], errors="coerce").mean(), 2) if gm["vel"] and gm["vel"] in tramo.columns else pd.NA
             puntos_detenidos = int((~tramo["_mov"]).sum())
 
-            # Definición circuito tipo camión de basura
             if (
                 dist_m >= DISTANCIA_MIN_CIRCUITO_METROS and
                 (pd.isna(vel_prom) or vel_prom <= VELOCIDAD_PROMEDIO_MAX_CIRCUITO) and
@@ -509,43 +499,19 @@ def reconstruir_circuitos(gps, gm, base):
                 lon_prom = tramo["_lon"].mean()
 
                 circuitos.append([
-                    nro,
-                    ini,
-                    fin,
-                    round(dur_min, 2),
-                    fmt_duracion_min(dur_min),
-                    km,
-                    dir_ini,
-                    dir_fin,
-                    maps_inicio,
-                    maps_final,
-                    maps_circuito,
-                    vel_prom,
-                    puntos_detenidos,
-                    hora_salida,
-                    lat_prom,
-                    lon_prom
+                    nro, ini, fin, round(dur_min, 2), fmt_duracion_min(dur_min), km,
+                    dir_ini, dir_fin, maps_inicio, maps_final, maps_circuito,
+                    vel_prom, puntos_detenidos, hora_salida, lat_prom, lon_prom
                 ])
 
             en_circuito = False
 
     df = pd.DataFrame(circuitos, columns=[
-        "Circuito",
-        "Inicio",
-        "Fin",
-        "Duración_min",
-        "Duración",
-        "Km",
-        "Punto_inicio",
-        "Punto_final",
-        "Google_Maps_Inicio",
-        "Google_Maps_Final",
-        "Google_Maps_Recorrido",
-        "Velocidad_promedio",
-        "Puntos_detenidos",
-        "Hora_salida",
-        "_Lat_centro",
-        "_Lon_centro"
+        "Circuito", "Inicio", "Fin", "Duración_min", "Duración", "Km",
+        "Punto_inicio", "Punto_final",
+        "Google_Maps_Inicio", "Google_Maps_Final", "Google_Maps_Recorrido",
+        "Velocidad_promedio", "Puntos_detenidos", "Hora_salida",
+        "_Lat_centro", "_Lon_centro"
     ])
 
     if not df.empty:
@@ -558,7 +524,6 @@ def reconstruir_circuitos(gps, gm, base):
         df["Google_Maps_Final"] = df["Google_Maps_Final"].apply(
             lambda x: f'<a href="{x}" target="_blank">Ver final</a>' if x else ""
         )
-
     return df
 
 
@@ -595,11 +560,10 @@ def clasificar_circuitos(circuitos):
         lambda f: "Habitual" if freq.get(f, 0) >= 2 else "Anómalo"
     )
 
-    df["Circuito_marcado"] = df.apply(
+    df["Circuito"] = df.apply(
         lambda r: f'🔴 {int(r["Circuito"])}' if r["Tipo_circuito"] == "Anómalo" else str(int(r["Circuito"])),
         axis=1
     )
-
     return df
 
 
@@ -608,7 +572,6 @@ def clasificar_circuitos(circuitos):
 # =========================================
 def detectar_sensor_combustible(sens, sm):
     col_sensor = sm["sensor"]
-
     candidatos = sens[
         sens[col_sensor].astype(str).str.lower().str.contains("nivel de combustible", na=False)
     ][col_sensor].dropna().unique().tolist()
@@ -626,12 +589,22 @@ def detectar_sensor_combustible(sens, sm):
     return fallback[0] if fallback else None
 
 
+def detectar_sensor_pedal(sens, sm):
+    col_sensor = sm["sensor"]
+    candidatos = sens[
+        sens[col_sensor].astype(str).str.lower().str.contains("pedal|acelerador|throttle", na=False, regex=True)
+    ][col_sensor].dropna().unique().tolist()
+    return candidatos[0] if candidatos else None
+
+
 def detectar_eventos_combustible(sens, sm, gps, gm):
     col_sensor = sm["sensor"]
     col_fecha = sm["fecha"]
     col_valor = sm["valor"]
 
     sensor_comb = detectar_sensor_combustible(sens, sm)
+    sensor_pedal = detectar_sensor_pedal(sens, sm)
+
     if sensor_comb is None:
         return pd.DataFrame(), None, pd.DataFrame()
 
@@ -639,6 +612,11 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
     serie["prev_valor"] = serie[col_valor].shift(1)
     serie["delta"] = serie[col_valor] - serie["prev_valor"]
     serie["delta_min"] = (serie[col_fecha] - serie[col_fecha].shift(1)).dt.total_seconds() / 60
+
+    pedal_df = None
+    if sensor_pedal:
+        pedal_df = sens[sens[col_sensor].astype(str).str.strip() == str(sensor_pedal)].copy().sort_values(col_fecha)
+        pedal_df = pedal_df[[col_fecha, col_valor]].rename(columns={col_valor: "_pedal_valor"})
 
     gf = gm["fecha"]
     gv = gm["vel"]
@@ -648,62 +626,68 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
 
     serie_merge = pd.merge_asof(
         serie,
-        gps_sorted[[gf, "_lat", "_lon", "_direccion_raw"] + ([gv] if gv else [])].sort_values(gf),
+        gps_sorted[[gf, "_lat", "_lon"] + ([gv] if gv else [])].sort_values(gf),
         left_on=col_fecha,
         right_on=gf,
         direction="nearest"
     )
+
+    if pedal_df is not None and not pedal_df.empty:
+        serie_merge = pd.merge_asof(
+            serie_merge.sort_values(col_fecha),
+            pedal_df.sort_values(col_fecha),
+            on=col_fecha,
+            direction="nearest"
+        )
+    else:
+        serie_merge["_pedal_valor"] = pd.NA
 
     eventos = serie_merge[serie_merge["delta"].abs() >= UMBRAL_CAMBIO_COMBUSTIBLE].copy()
     if eventos.empty:
         return pd.DataFrame(), sensor_comb, serie_merge
 
     clasifs = []
-    colores = []
     maps = []
 
     for _, r in eventos.iterrows():
         vel = r[gv] if gv and gv in eventos.columns else None
         detenido = False if vel is None or pd.isna(vel) else vel <= VELOCIDAD_MOVIMIENTO
+        dur_ok = pd.notna(r["delta_min"]) and float(r["delta_min"]) >= UMBRAL_DETENCION_COMBUSTIBLE_MIN
+
+        pedal_val = safe_float(r["_pedal_valor"])
+        pedal_quieto = pedal_val is None or pedal_val <= 1
 
         if r["delta"] > 0:
             clasifs.append("🟢 Carga de combustible")
-            colores.append("verde")
+            maps.append(maps_pin_url(r["_lat"], r["_lon"]))
         else:
-            if detenido:
-                if pd.notna(r["delta_min"]) and r["delta_min"] <= 15:
-                    clasifs.append("🔴 Posible robo de combustible")
-                    colores.append("rojo")
-                else:
-                    clasifs.append("🟠 Duda / revisar")
-                    colores.append("naranja")
+            if detenido and dur_ok and pedal_quieto:
+                clasifs.append("🔴 Posible robo de combustible")
+                maps.append(maps_pin_url(r["_lat"], r["_lon"]))
+            elif detenido and dur_ok:
+                clasifs.append("🟠 Duda / revisar")
+                maps.append(maps_pin_url(r["_lat"], r["_lon"]))
             else:
                 clasifs.append(None)
-                colores.append(None)
-
-        maps.append(maps_pin_url(r["_lat"], r["_lon"]))
+                maps.append(None)
 
     eventos["Clasificación"] = clasifs
-    eventos["Color"] = colores
     eventos["Google_Maps"] = maps
-
     eventos = eventos[eventos["Clasificación"].notna()].copy()
+
     if eventos.empty:
         return pd.DataFrame(), sensor_comb, serie_merge
 
-    out = eventos[[
-        col_fecha, "prev_valor", col_valor, "delta",
-        "Google_Maps", "Clasificación"
-    ]].copy()
-
+    out = eventos[[col_fecha, "prev_valor", col_valor, "delta", "delta_min", "Google_Maps", "Clasificación"]].copy()
     out.columns = [
         "Fecha_hora", "Nivel_antes", "Nivel_después", "Variación",
-        "Google_Maps", "Clasificación"
+        "Duración_evento_min", "Google_Maps", "Clasificación"
     ]
-
+    out["Duración_evento"] = out["Duración_evento_min"].apply(fmt_duracion_min)
     out["Google_Maps"] = out["Google_Maps"].apply(
         lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
     )
+    out = out[["Fecha_hora", "Nivel_antes", "Nivel_después", "Variación", "Duración_evento", "Google_Maps", "Clasificación"]]
 
     return out, sensor_comb, serie_merge
 
@@ -713,7 +697,6 @@ def agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm):
         return circuitos
 
     df = circuitos.copy()
-
     if serie_comb_merge is None or serie_comb_merge.empty:
         df["Combustible_consumido_aprox"] = pd.NA
         return df
@@ -722,7 +705,6 @@ def agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm):
     col_valor = sm["valor"]
 
     consumos = []
-
     base = serie_comb_merge.copy()
     base[col_fecha] = pd.to_datetime(base[col_fecha], errors="coerce")
     base[col_valor] = pd.to_numeric(base[col_valor], errors="coerce")
@@ -730,7 +712,6 @@ def agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm):
     for _, c in df.iterrows():
         ini = pd.to_datetime(c["Inicio"], errors="coerce")
         fin = pd.to_datetime(c["Fin"], errors="coerce")
-
         tramo = base[(base[col_fecha] >= ini) & (base[col_fecha] <= fin)].copy()
 
         consumo = 0.0
@@ -755,14 +736,13 @@ def detectar_desvios(gps, gm, base, circuitos):
         return pd.DataFrame()
 
     gf = gm["fecha"]
-
     gps = gps.copy()
     gps["_dist_base_m"] = gps.apply(
         lambda r: haversine_m(r["_lat"], r["_lon"], base["lat"], base["lon"]) or 0,
         axis=1
     )
+    gps["_ubicacion_texto"] = gps["_direccion_raw"].astype(str).replace("nan", "").str.strip()
 
-    # puntos habituales por direcciones de circuitos habituales
     habituales = set()
     if not circuitos.empty:
         circ_hab = circuitos[circuitos["Tipo_circuito"] == "Habitual"]
@@ -771,9 +751,6 @@ def detectar_desvios(gps, gm, base, circuitos):
                 habituales.add(str(r["Punto_inicio"]).strip())
             if pd.notna(r["Punto_final"]):
                 habituales.add(str(r["Punto_final"]).strip())
-
-    gps["_ubicacion_texto"] = gps["_direccion_raw"].astype(str).replace("nan", "").str.strip()
-    gps["_punto_habitual"] = gps["_ubicacion_texto"].apply(lambda x: x in habituales if x else False)
 
     eventos = []
     en_det = False
@@ -785,7 +762,6 @@ def detectar_desvios(gps, gm, base, circuitos):
         if detenido and not en_det:
             en_det = True
             ini_idx = i
-
         elif not detenido and en_det:
             fin_idx = i - 1
             tramo = gps.loc[ini_idx:fin_idx].copy()
@@ -795,29 +771,27 @@ def detectar_desvios(gps, gm, base, circuitos):
                 lat_m = tramo["_lat"].mean()
                 lon_m = tramo["_lon"].mean()
                 dist_base_km = round((haversine_m(lat_m, lon_m, base["lat"], base["lon"]) or 0) / 1000, 2)
-                ubic = tramo["_ubicacion_texto"].mode().iloc[0] if not tramo["_ubicacion_texto"].dropna().empty else "Ubicación no disponible"
+
+                ubic = tramo["_ubicacion_texto"].mode().iloc[0] if not tramo["_ubicacion_texto"].dropna().empty else ""
                 habitual = ubic in habituales if ubic else False
 
-                if not habitual:
+                if dist_base_km > 1 and not habitual:
                     eventos.append([
                         tramo[gf].min(),
-                        ubic,
                         dist_base_km,
                         fmt_duracion_min(mins),
                         maps_pin_url(lat_m, lon_m)
                     ])
-
             en_det = False
 
     df = pd.DataFrame(eventos, columns=[
-        "Fecha_hora", "Ubicación", "Distancia_base_km", "Tiempo_detenido", "Google_Maps"
+        "Fecha_hora", "Distancia_base_km", "Tiempo_detenido", "Google_Maps"
     ])
 
     if not df.empty:
         df["Google_Maps"] = df["Google_Maps"].apply(
             lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else ""
         )
-
     return df
 
 
@@ -828,24 +802,35 @@ def filtrar_detenciones_fuera_de_base(det_fuera, circuitos):
     if det_fuera.empty:
         return det_fuera
 
-    habituales = pd.DataFrame()
+    habituales = set()
     if not circuitos.empty:
-        habituales = circuitos[circuitos["Tipo_circuito"] == "Habitual"].copy()
-
-    ubic_habituales = set()
-    for _, c in habituales.iterrows():
-        ubic_habituales.add(str(c["Punto_inicio"]).strip())
-        ubic_habituales.add(str(c["Punto_final"]).strip())
+        circ_hab = circuitos[circuitos["Tipo_circuito"] == "Habitual"]
+        for _, c in circ_hab.iterrows():
+            if pd.notna(c["Punto_inicio"]):
+                habituales.add(str(c["Punto_inicio"]).strip())
+            if pd.notna(c["Punto_final"]):
+                habituales.add(str(c["Punto_final"]).strip())
 
     rows = []
     for _, det in det_fuera.iterrows():
         if det["Duración_min"] <= UMBRAL_DETENCION_MIN:
             continue
 
-        if str(det["Ubicación"]).strip() in ubic_habituales:
-            continue
+        # detención habitual si está cerca de otra detención repetida
+        habitual = False
+        for _, other in det_fuera.iterrows():
+            if other.name == det.name:
+                continue
+            d = haversine_m(det["Lat"], det["Lon"], other["Lat"], other["Lon"])
+            if d is not None and d <= 120:
+                habitual = True
+                break
 
-        rows.append(det)
+        if not habitual:
+            row = det.copy()
+            row["Habitual"] = "No"
+            row["Interpretación_operativa"] = "Detención fuera de base no habitual"
+            rows.append(row)
 
     if not rows:
         return pd.DataFrame(columns=det_fuera.columns)
@@ -927,8 +912,107 @@ def detectar_patrones_chofer(circuitos):
         Esta clasificación es inferencial y se basa en horario de salida, velocidad media y duración del circuito.
     </p>
     """
-
     return texto, resumen
+
+
+# =========================================
+# PDF
+# =========================================
+def build_pdf(report):
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm
+    )
+
+    styles = getSampleStyleSheet()
+    title = ParagraphStyle(
+        "TitleRT",
+        parent=styles["Title"],
+        textColor=colors.HexColor("#18324a"),
+        fontSize=22,
+        leading=26,
+        spaceAfter=10
+    )
+    h2 = ParagraphStyle(
+        "H2RT",
+        parent=styles["Heading2"],
+        textColor=colors.HexColor("#24557a"),
+        fontSize=14,
+        leading=18,
+        spaceBefore=10,
+        spaceAfter=8
+    )
+    body = styles["BodyText"]
+    body.leading = 14
+
+    story = []
+    story.append(Paragraph("Informe Técnico de Auditoría de Flota", title))
+    story.append(Paragraph(report["subtitle"], body))
+    story.append(Spacer(1, 8))
+
+    resumen = report["resumen"]
+    story.append(Paragraph("1. Resumen Ejecutivo", h2))
+    for k, v in resumen.items():
+        story.append(Paragraph(f"<b>{escape(str(k))}:</b> {escape(str(v))}", body))
+
+    sections = [
+        ("2. Base operativa", report["base"]),
+        ("3. Circuitos de trabajo", report["circuitos"]),
+        ("4. Detenciones fuera de base", report["detenciones"]),
+        ("5. Detección de desvíos", report["desvios"]),
+        ("6. Auditoría de combustible", report["combustible"]),
+        ("7. Patrones de conducción", report["patrones"]),
+    ]
+
+    for title_txt, data in sections:
+        story.append(Spacer(1, 10))
+        story.append(Paragraph(title_txt, h2))
+
+        if isinstance(data, str):
+            story.append(Paragraph(data, body))
+            continue
+
+        pdf_data = row_to_pdf_table(data)
+        table = Table(pdf_data, repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#18324a")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("LEADING", (0, 0), (-1, -1), 10),
+            ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#cbd5e1")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(table)
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+
+@app.route("/pdf/<report_id>")
+def download_pdf(report_id):
+    report = REPORT_CACHE.get(report_id)
+    if not report:
+        abort(404)
+
+    pdf = build_pdf(report)
+    return send_file(
+        pdf,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name="auditoria_flota.pdf"
+    )
 
 
 # =========================================
@@ -968,10 +1052,7 @@ def index():
                 if len(odo) >= 2:
                     delta_odo = odo.max() - odo.min()
                     if pd.notna(delta_odo):
-                        if delta_odo > 1000:
-                            total_km = round(delta_odo / 1000, 2)
-                        else:
-                            total_km = round(delta_odo, 2)
+                        total_km = round(delta_odo / 1000, 2) if delta_odo > 1000 else round(delta_odo, 2)
 
             vel_max = "No disponible"
             if gv and gv in gps.columns:
@@ -979,13 +1060,12 @@ def index():
                 vel_max = round(vmax, 2) if pd.notna(vmax) else "No disponible"
 
             detenciones = detectar_detenciones(gps, gm)
-            base = detectar_base_operativa(detenciones)
+            base = detectar_base_operativa(detenciones, gps)
             detenciones = etiquetar_base(detenciones, base)
 
             det_fuera = detenciones[detenciones["Es_base"] == False].copy() if not detenciones.empty else pd.DataFrame()
 
             tiempo_det = round(detenciones["Duración_min"].sum(), 2) if not detenciones.empty else 0
-
             tiempo_mov = "No disponible"
             if pd.notna(periodo_ini) and pd.notna(periodo_fin):
                 tiempo_total_min = (periodo_fin - periodo_ini).total_seconds() / 60
@@ -996,12 +1076,7 @@ def index():
 
             det_fuera = filtrar_detenciones_fuera_de_base(det_fuera, circuitos)
 
-            if not det_fuera.empty:
-                det_fuera["Habitual"] = "No"
-                det_fuera["Interpretación_operativa"] = "Detención fuera de base no habitual"
-
             eventos_comb, sensor_comb, serie_comb_merge = detectar_eventos_combustible(sens, sm, gps, gm)
-
             consumo_total = "No disponible"
             if serie_comb_merge is not None and not serie_comb_merge.empty:
                 col_valor = sm["valor"]
@@ -1011,19 +1086,62 @@ def index():
                     consumo_total = round(diff_total, 2) if diff_total > 0 else 0.0
 
             circuitos = agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm)
-
             desvios = detectar_desvios(gps, gm, base, circuitos)
-
             patrones_texto, patrones_df = detectar_patrones_chofer(circuitos)
 
             if base:
                 base_html = (
-                    f'<p><b>Ubicación:</b> {escape(base["ubicacion"])}</p>'
-                    f'<p><b>Duración de permanencia:</b> {fmt_duracion_min(base["duracion_min"])}</p>'
-                    f'<p><b>Ver en Google Maps:</b> <a href="{base["maps"]}" target="_blank">Abrir ubicación</a></p>'
+                    f'<div class="callout">'
+                    f'<div><b>Ubicación base:</b> {escape(str(base["maps"]))}</div>'
+                    f'<div><b>Duración de permanencia:</b> {fmt_duracion_min(base["duracion_min"])}</div>'
+                    f'<div><a href="{base["maps"]}" target="_blank">Abrir ubicación en Google Maps</a></div>'
+                    f'</div>'
                 )
             else:
                 base_html = "<p>No fue posible identificar base operativa.</p>"
+
+            # tablas html visibles
+            circuitos_html = circuitos[[
+                "Circuito", "Inicio", "Fin", "Duración", "Km", "Tipo_circuito",
+                "Punto_inicio", "Punto_final",
+                "Google_Maps_Inicio", "Google_Maps_Final", "Google_Maps_Recorrido"
+            ]].copy() if not circuitos.empty else pd.DataFrame()
+
+            det_fuera_html = det_fuera[[
+                "Inicio", "Fin", "Duración", "Google_Maps", "Habitual", "Interpretación_operativa"
+            ]].copy() if not det_fuera.empty else pd.DataFrame()
+
+            desvios_html = desvios[[
+                "Fecha_hora", "Distancia_base_km", "Tiempo_detenido", "Google_Maps"
+            ]].copy() if not desvios.empty else pd.DataFrame()
+
+            combustible_html = eventos_comb[[
+                "Fecha_hora", "Nivel_antes", "Nivel_después", "Variación",
+                "Duración_evento", "Google_Maps", "Clasificación"
+            ]].copy() if not eventos_comb.empty else pd.DataFrame()
+
+            # cache para pdf
+            report_id = str(uuid.uuid4())
+            REPORT_CACHE[report_id] = {
+                "subtitle": "Análisis cruzado entre histórico GPS y sensores del vehículo.",
+                "resumen": {
+                    "Período analizado": f"{fmt_fecha(periodo_ini)} - {fmt_fecha(periodo_fin)}",
+                    "Distancia total": f"{total_km} km",
+                    "Velocidad máxima": vel_max,
+                    "Tiempo en movimiento": tiempo_mov,
+                    "Tiempo detenido": fmt_duracion_min(tiempo_det),
+                    "Consumo total de combustible": consumo_total,
+                },
+                "base": pd.DataFrame([{
+                    "Ubicación Maps": base["maps"] if base else "No disponible",
+                    "Duración de permanencia": fmt_duracion_min(base["duracion_min"]) if base else "No disponible"
+                }]),
+                "circuitos": circuitos_html,
+                "detenciones": det_fuera_html,
+                "desvios": desvios_html,
+                "combustible": combustible_html,
+                "patrones": patrones_df if not patrones_df.empty else "Sin patrones suficientes."
+            }
 
             html = f"""
             <html>
@@ -1035,148 +1153,167 @@ def index():
                     body {{
                         margin: 0;
                         font-family: Arial, sans-serif;
-                        background: #f4f7fb;
-                        color: #1f2937;
+                        background: linear-gradient(180deg, #eef4fb 0%, #f8fafc 100%);
+                        color: #102133;
                     }}
                     .container {{
                         max-width: 1280px;
-                        margin: 30px auto;
+                        margin: 28px auto;
                         padding: 20px;
                     }}
-                    .topbar {{
+                    .hero {{
                         background: linear-gradient(135deg, #18324a, #24557a);
                         color: white;
-                        border-radius: 18px;
-                        padding: 28px;
-                        margin-bottom: 24px;
-                        box-shadow: 0 12px 30px rgba(0,0,0,0.12);
+                        border-radius: 22px;
+                        padding: 30px;
+                        box-shadow: 0 18px 40px rgba(0,0,0,0.16);
+                        margin-bottom: 22px;
                     }}
-                    .topbar h1 {{
-                        margin: 0 0 8px 0;
-                        font-size: 30px;
-                    }}
-                    .topbar p {{
-                        margin: 0;
-                        opacity: 0.95;
-                        line-height: 1.5;
-                    }}
+                    .hero h1 {{ margin: 0 0 8px; font-size: 30px; }}
+                    .hero p {{ margin: 0; opacity: .95; line-height: 1.55; }}
+
                     .summary-grid {{
                         display: grid;
                         grid-template-columns: repeat(4, 1fr);
                         gap: 16px;
-                        margin-bottom: 24px;
+                        margin-bottom: 22px;
                     }}
                     .metric {{
                         background: white;
-                        border-radius: 16px;
+                        border-radius: 18px;
                         padding: 18px;
-                        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+                        box-shadow: 0 8px 24px rgba(15,23,42,.08);
+                        border: 1px solid #e5edf5;
                     }}
                     .metric .label {{
-                        font-size: 13px;
+                        font-size: 12px;
                         color: #64748b;
                         margin-bottom: 8px;
+                        text-transform: uppercase;
+                        letter-spacing: .04em;
                     }}
                     .metric .value {{
                         font-size: 24px;
-                        font-weight: bold;
+                        font-weight: 700;
                         color: #0f172a;
                     }}
+
                     .section {{
                         background: white;
-                        border-radius: 18px;
+                        border-radius: 20px;
                         padding: 22px;
-                        margin-bottom: 22px;
-                        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+                        margin-bottom: 20px;
+                        box-shadow: 0 8px 24px rgba(15,23,42,.08);
+                        border: 1px solid #e5edf5;
                     }}
                     .section h2 {{
                         margin-top: 0;
                         color: #18324a;
-                        border-bottom: 1px solid #e5e7eb;
+                        border-bottom: 1px solid #e2e8f0;
                         padding-bottom: 10px;
                     }}
-                    table {{
-                        width: 100%;
-                        border-collapse: collapse;
-                        margin-top: 14px;
-                        font-size: 14px;
+                    .callout {{
+                        background: #eff6ff;
+                        border-left: 5px solid #2563eb;
+                        padding: 14px 16px;
+                        border-radius: 12px;
+                        line-height: 1.6;
                     }}
-                    th, td {{
-                        border: 1px solid #e5e7eb;
-                        padding: 10px;
+
+                    table.report-table {{
+                        width: 100%;
+                        border-collapse: separate;
+                        border-spacing: 0;
+                        margin-top: 14px;
+                        overflow: hidden;
+                        border-radius: 14px;
+                    }}
+                    .report-table thead th {{
+                        background: #18324a;
+                        color: white;
+                        padding: 11px;
                         text-align: left;
+                        font-size: 13px;
+                    }}
+                    .report-table tbody td {{
+                        background: white;
+                        padding: 10px;
+                        border-bottom: 1px solid #e5e7eb;
+                        font-size: 13px;
                         vertical-align: top;
                     }}
-                    th {{
+                    .report-table tbody tr:nth-child(even) td {{
                         background: #f8fafc;
-                        color: #334155;
                     }}
-                    tr:nth-child(even) {{
-                        background: #fafafa;
-                    }}
-                    .back {{
-                        text-align: center;
-                        margin: 24px 0 40px;
-                    }}
-                    .back a {{
+                    a {{
+                        color: #0f62fe;
                         text-decoration: none;
+                        font-weight: 600;
+                    }}
+                    a:hover {{ text-decoration: underline; }}
+
+                    .footer-actions {{
+                        display: flex;
+                        justify-content: center;
+                        gap: 14px;
+                        margin: 28px 0 40px;
+                        flex-wrap: wrap;
+                    }}
+                    .btn {{
+                        display: inline-block;
                         background: #0f62fe;
                         color: white;
-                        padding: 12px 18px;
+                        padding: 13px 18px;
                         border-radius: 12px;
-                        font-weight: bold;
-                        box-shadow: 0 6px 18px rgba(15, 98, 254, 0.22);
+                        font-weight: 700;
+                        box-shadow: 0 6px 18px rgba(15,98,254,.22);
                     }}
-                    .back a:hover {{
-                        background: #0b4fd1;
+                    .btn.secondary {{
+                        background: #18324a;
                     }}
+
                     @media (max-width: 980px) {{
-                        .summary-grid {{
-                            grid-template-columns: repeat(2, 1fr);
-                        }}
+                        .summary-grid {{ grid-template-columns: repeat(2, 1fr); }}
                     }}
                     @media (max-width: 640px) {{
-                        .summary-grid {{
-                            grid-template-columns: 1fr;
-                        }}
+                        .summary-grid {{ grid-template-columns: 1fr; }}
                     }}
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <div class="topbar">
+                    <div class="hero">
                         <h1>Informe Técnico de Auditoría de Flota</h1>
                         <p>
                             Análisis cruzado entre histórico GPS y sensores del vehículo.
-                            Evaluación de base operativa, circuitos, consumo de combustible,
-                            desvíos y patrones de conducción.
+                            Evaluación de base operativa, circuitos, desvíos, combustible y patrones de conducción.
                         </p>
                     </div>
 
                     <div class="summary-grid">
                         <div class="metric">
                             <div class="label">Período analizado</div>
-                            <div class="value" style="font-size:16px;">{fmt_fecha(periodo_ini)}<br>{fmt_fecha(periodo_fin)}</div>
+                            <div class="value" style="font-size:15px;">{fmt_fecha(periodo_ini)}<br>{fmt_fecha(periodo_fin)}</div>
                         </div>
                         <div class="metric">
                             <div class="label">Distancia total</div>
                             <div class="value">{total_km} km</div>
                         </div>
                         <div class="metric">
-                            <div class="label">Detenciones</div>
-                            <div class="value">{len(detenciones)}</div>
+                            <div class="label">Tiempo en movimiento</div>
+                            <div class="value" style="font-size:20px;">{tiempo_mov}</div>
                         </div>
                         <div class="metric">
-                            <div class="label">Velocidad máxima</div>
-                            <div class="value">{vel_max}</div>
+                            <div class="label">Consumo total</div>
+                            <div class="value">{consumo_total}</div>
                         </div>
                     </div>
 
                     <div class="section">
                         <h2>1. Resumen Ejecutivo</h2>
-                        <p><b>Tiempo en movimiento:</b> {tiempo_mov}</p>
+                        <p><b>Velocidad máxima:</b> {vel_max}</p>
                         <p><b>Tiempo detenido:</b> {fmt_duracion_min(tiempo_det)}</p>
-                        <p><b>Consumo total de combustible:</b> {consumo_total}</p>
+                        <p><b>Cantidad total de detenciones detectadas:</b> {len(detenciones)}</p>
                     </div>
 
                     <div class="section">
@@ -1186,51 +1323,23 @@ def index():
 
                     <div class="section">
                         <h2>3. Circuitos de trabajo</h2>
-                        {
-                            html_tabla(
-                                circuitos[[
-                                    "Circuito_marcado",
-                                    "Inicio",
-                                    "Fin",
-                                    "Duración",
-                                    "Km",
-                                    "Tipo_circuito",
-                                    "Punto_inicio",
-                                    "Punto_final",
-                                    "Combustible_consumido_aprox",
-                                    "Google_Maps_Inicio",
-                                    "Google_Maps_Final",
-                                    "Google_Maps_Recorrido"
-                                ]],
-                                index=False
-                            ) if not circuitos.empty else "<p>Sin circuitos detectados.</p>"
-                        }
+                        {html_tabla(circuitos_html, index=False) if not circuitos_html.empty else "<p>Sin circuitos detectados.</p>"}
                     </div>
 
                     <div class="section">
                         <h2>4. Análisis de detenciones fuera de base</h2>
-                        {
-                            html_tabla(
-                                det_fuera[["Inicio", "Fin", "Duración", "Google_Maps", "Habitual", "Interpretación_operativa"]],
-                                index=False
-                            ) if not det_fuera.empty else "<p>No se detectaron detenciones fuera de base relevantes.</p>"
-                        }
+                        {html_tabla(det_fuera_html, index=False) if not det_fuera_html.empty else "<p>No se detectaron detenciones fuera de base relevantes.</p>"}
                     </div>
 
                     <div class="section">
                         <h2>5. Detección de desvíos</h2>
-                        {
-                            html_tabla(
-                                desvios[["Fecha_hora", "Ubicación", "Distancia_base_km", "Tiempo_detenido", "Google_Maps"]],
-                                index=False
-                            ) if not desvios.empty else "<p>No se detectaron desvíos relevantes con la configuración actual.</p>"
-                        }
+                        {html_tabla(desvios_html, index=False) if not desvios_html.empty else "<p>No se detectaron desvíos relevantes con la configuración actual.</p>"}
                     </div>
 
                     <div class="section">
                         <h2>6. Auditoría de combustible</h2>
                         <p><b>Sensor utilizado:</b> {escape(str(sensor_comb)) if sensor_comb else "No detectado"}</p>
-                        {html_tabla(eventos_comb, index=False) if not eventos_comb.empty else "<p>No se detectaron eventos de combustible relevantes.</p>"}
+                        {html_tabla(combustible_html, index=False) if not combustible_html.empty else "<p>No se detectaron eventos de combustible relevantes.</p>"}
                     </div>
 
                     <div class="section">
@@ -1239,8 +1348,9 @@ def index():
                         {html_tabla(patrones_df, index=False) if not patrones_df.empty else "<p>Sin patrones suficientes.</p>"}
                     </div>
 
-                    <div class="back">
-                        <a href="/">Nueva auditoría</a>
+                    <div class="footer-actions">
+                        <a class="btn" href="/pdf/{report_id}" target="_blank">Descargar PDF</a>
+                        <a class="btn secondary" href="/">Nueva auditoría</a>
                     </div>
                 </div>
             </body>
@@ -1270,20 +1380,20 @@ def index():
             body {
                 margin: 0;
                 font-family: Arial, sans-serif;
-                background: #f4f7fb;
-                color: #1f2937;
+                background: linear-gradient(180deg, #eef4fb 0%, #f8fafc 100%);
+                color: #102133;
             }
             .wrapper {
                 max-width: 980px;
-                margin: 40px auto;
+                margin: 42px auto;
                 padding: 24px;
             }
             .hero {
                 background: linear-gradient(135deg, #18324a, #24557a);
                 color: white;
-                border-radius: 18px;
-                padding: 32px;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.12);
+                border-radius: 22px;
+                padding: 34px;
+                box-shadow: 0 16px 40px rgba(0,0,0,0.16);
                 margin-bottom: 24px;
             }
             .hero h1 {
@@ -1292,15 +1402,15 @@ def index():
             }
             .hero p {
                 margin: 0;
-                font-size: 16px;
-                line-height: 1.5;
-                opacity: 0.95;
+                line-height: 1.6;
+                opacity: .95;
             }
             .card {
                 background: white;
-                border-radius: 18px;
-                padding: 24px;
-                box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+                border-radius: 20px;
+                padding: 26px;
+                box-shadow: 0 8px 24px rgba(15,23,42,.08);
+                border: 1px solid #e5edf5;
             }
             .card h2 {
                 margin-top: 0;
@@ -1309,8 +1419,8 @@ def index():
             .form-grid {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
-                gap: 20px;
-                margin-top: 20px;
+                gap: 18px;
+                margin-top: 18px;
             }
             .field {
                 display: flex;
@@ -1339,26 +1449,20 @@ def index():
                 font-size: 15px;
                 font-weight: bold;
                 cursor: pointer;
-                box-shadow: 0 6px 18px rgba(15, 98, 254, 0.22);
-            }
-            input[type="submit"]:hover {
-                background: #0b4fd1;
+                box-shadow: 0 6px 18px rgba(15,98,254,.22);
             }
             .help {
                 margin-top: 18px;
                 padding: 14px 16px;
-                background: #eef6ff;
-                border-left: 4px solid #0f62fe;
-                border-radius: 10px;
+                background: #eff6ff;
+                border-left: 4px solid #2563eb;
+                border-radius: 12px;
                 color: #1e3a5f;
+                line-height: 1.6;
             }
             @media (max-width: 768px) {
-                .form-grid {
-                    grid-template-columns: 1fr;
-                }
-                .hero h1 {
-                    font-size: 26px;
-                }
+                .form-grid { grid-template-columns: 1fr; }
+                .hero h1 { font-size: 26px; }
             }
         </style>
     </head>
@@ -1369,8 +1473,7 @@ def index():
                 <p>
                     Plataforma de análisis cruzado entre histórico GPS y sensores.
                     Identifica base operativa, circuitos habituales y anómalos,
-                    dibuja recorridos en Google Maps, analiza consumo de combustible
-                    y detecta patrones de conducción.
+                    dibuja recorridos en Google Maps, analiza combustible y genera PDF.
                 </p>
             </div>
 
@@ -1382,7 +1485,6 @@ def index():
                             <label>Archivo de sensores</label>
                             <input type="file" name="sensores" required>
                         </div>
-
                         <div class="field">
                             <label>Archivo histórico GPS</label>
                             <input type="file" name="historico" required>
@@ -1395,7 +1497,7 @@ def index():
                 </form>
 
                 <div class="help">
-                    <b>Formatos compatibles:</b> CSV y Excel (.xlsx / .xls).
+                    <b>Formatos compatibles:</b> CSV y Excel (.xlsx / .xls).<br>
                     En históricos Excel, la app prioriza la hoja <b>Resultados</b> si existe.
                 </div>
             </div>

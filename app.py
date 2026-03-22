@@ -10,9 +10,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-)
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 
 app = Flask(__name__)
 
@@ -21,18 +19,23 @@ app = Flask(__name__)
 # =========================================
 UMBRAL_DETENCION_MIN = 6
 UMBRAL_CAMBIO_COMBUSTIBLE = 5.0
-DISTANCIA_BASE_METROS = 100
-DISTANCIA_DESVIO_METROS = 1000
-VELOCIDAD_MOVIMIENTO = 3
+DISTANCIA_BASE_METROS = 100            # una cuadra aprox.
+DISTANCIA_DESVIO_METROS = 1000         # desvíos > 1 km
+VELOCIDAD_MOVIMIENTO = 3               # km/h
 
+# Circuito tipo camión de basura
 DISTANCIA_MIN_CIRCUITO_METROS = 500
 VELOCIDAD_PROMEDIO_MAX_CIRCUITO = 35
 MIN_PUNTOS_DETENIDOS_CIRCUITO = 3
 
+# Google Maps
 MAX_WAYPOINTS_MAPS = 8
+
+# Combustible
 UMBRAL_NO_MOVIMIENTO_METROS = 30
 UMBRAL_DETENCION_COMBUSTIBLE_MIN = 6
 
+# Cache temporal para PDF
 REPORT_CACHE = {}
 
 
@@ -126,7 +129,7 @@ def fmt_duracion_min(mins):
 
 def html_tabla(df, index=False):
     if df is None or df.empty:
-        return "<p>Sin datos.</p>"
+        return '<p class="empty-text">Sin datos.</p>'
     return df.to_html(index=index, border=0, escape=False, classes="report-table")
 
 
@@ -164,8 +167,10 @@ def sample_indices(n, max_points):
         return []
     if n <= max_points:
         return list(range(n))
+
     step = (n - 1) / (max_points - 1)
     idxs = [round(i * step) for i in range(max_points)]
+
     out = []
     seen = set()
     for i in idxs:
@@ -229,15 +234,6 @@ def extraer_localidad_barrio_desde_texto(texto):
     return {"localidad": localidad, "barrio": barrio}
 
 
-def texto_ubicacion(localidad, barrio):
-    partes = []
-    if barrio and barrio != "Barrio no disponible":
-        partes.append(barrio)
-    if localidad and localidad != "Localidad no disponible":
-        partes.append(localidad)
-    return ", ".join(partes) if partes else "Ubicación no disponible"
-
-
 def row_to_pdf_table(df):
     if df is None or df.empty:
         return [["Sin datos"]]
@@ -245,6 +241,14 @@ def row_to_pdf_table(df):
     for _, row in df.iterrows():
         data.append([str("" if pd.isna(v) else v) for v in row.tolist()])
     return data
+
+
+def direccion_mode(series):
+    s = series.dropna().astype(str).str.strip()
+    s = s[s != ""]
+    if s.empty:
+        return "Dirección no disponible"
+    return s.mode().iloc[0]
 
 
 # =========================================
@@ -255,7 +259,7 @@ def preparar_gps(df):
     col_vel = buscar_columna(df, ["velocidad", "speed"])
     col_odo = buscar_columna(df, ["odómetro", "odometro", "odometer"])
     col_coord = buscar_columna(df, ["coordenadas", "coordinates"])
-    col_ubi = buscar_columna(df, ["ubicación", "ubicacion", "address", "direccion", "dirección", "location"])
+    col_ubi = buscar_columna(df, ["ubicación", "ubicacion", "address", "direccion", "dirección", "location", "calle", "domicilio"])
 
     if not col_fecha:
         raise Exception(f"El archivo GPS debe tener columna de fecha. Detectadas: {list(df.columns)}")
@@ -361,9 +365,10 @@ def detectar_detenciones(gps, gm):
             if mins >= UMBRAL_DETENCION_MIN:
                 lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
                 lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
+                direccion = direccion_mode(gps.loc[ini_idx:fin_idx, "_direccion_raw"])
                 eventos.append([
                     ini, fin, round(mins, 2), fmt_duracion_min(mins),
-                    lat_m, lon_m, maps_pin_url(lat_m, lon_m)
+                    direccion, lat_m, lon_m, maps_pin_url(lat_m, lon_m)
                 ])
             en_det = False
 
@@ -375,14 +380,15 @@ def detectar_detenciones(gps, gm):
         if mins >= UMBRAL_DETENCION_MIN:
             lat_m = gps.loc[ini_idx:fin_idx, "_lat"].mean()
             lon_m = gps.loc[ini_idx:fin_idx, "_lon"].mean()
+            direccion = direccion_mode(gps.loc[ini_idx:fin_idx, "_direccion_raw"])
             eventos.append([
                 ini, fin, round(mins, 2), fmt_duracion_min(mins),
-                lat_m, lon_m, maps_pin_url(lat_m, lon_m)
+                direccion, lat_m, lon_m, maps_pin_url(lat_m, lon_m)
             ])
 
     df = pd.DataFrame(eventos, columns=[
         "Inicio", "Fin", "Duración_min", "Duración",
-        "Lat", "Lon", "Google_Maps"
+        "Dirección", "Lat", "Lon", "Google_Maps"
     ])
 
     if not df.empty:
@@ -396,27 +402,31 @@ def detectar_detenciones(gps, gm):
 # BASE OPERATIVA
 # =========================================
 def detectar_base_operativa(detenciones, gps):
-    if detenciones.empty:
-        # fallback por cluster simple en gps detenido
-        quietos = gps[~gps["_mov"]].copy()
-        if quietos.empty:
-            return None
-        lat = quietos["_lat"].mean()
-        lon = quietos["_lon"].mean()
+    if not detenciones.empty:
+        dets = detenciones.sort_values("Duración_min", ascending=False).reset_index(drop=True)
+        b = dets.iloc[0]
         return {
-            "lat": lat,
-            "lon": lon,
-            "duracion_min": 0,
-            "maps": maps_pin_url(lat, lon)
+            "lat": b["Lat"],
+            "lon": b["Lon"],
+            "duracion_min": b["Duración_min"],
+            "direccion": b["Dirección"],
+            "maps": maps_pin_url(b["Lat"], b["Lon"])
         }
 
-    dets = detenciones.sort_values("Duración_min", ascending=False).reset_index(drop=True)
-    b = dets.iloc[0]
+    quietos = gps[~gps["_mov"]].copy()
+    if quietos.empty:
+        return None
+
+    lat = quietos["_lat"].mean()
+    lon = quietos["_lon"].mean()
+    direccion = direccion_mode(quietos["_direccion_raw"])
+
     return {
-        "lat": b["Lat"],
-        "lon": b["Lon"],
-        "duracion_min": b["Duración_min"],
-        "maps": maps_pin_url(b["Lat"], b["Lon"])
+        "lat": lat,
+        "lon": lon,
+        "duracion_min": 0,
+        "direccion": direccion,
+        "maps": maps_pin_url(lat, lon)
     }
 
 
@@ -487,8 +497,8 @@ def reconstruir_circuitos(gps, gm, base):
                 dur_min = (fin - ini).total_seconds() / 60
                 km = round(tramo["_dist_km"].sum(), 2)
 
-                dir_ini = str(tramo.iloc[0]["_direccion_raw"]) if pd.notna(tramo.iloc[0]["_direccion_raw"]) else "Inicio no disponible"
-                dir_fin = str(tramo.iloc[-1]["_direccion_raw"]) if pd.notna(tramo.iloc[-1]["_direccion_raw"]) else "Final no disponible"
+                dir_ini = direccion_mode(pd.Series([tramo.iloc[0]["_direccion_raw"]]))
+                dir_fin = direccion_mode(pd.Series([tramo.iloc[-1]["_direccion_raw"]]))
 
                 maps_circuito = maps_route_url(tramo)
                 maps_inicio = maps_pin_url(tramo.iloc[0]["_lat"], tramo.iloc[0]["_lon"])
@@ -658,14 +668,14 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
         pedal_quieto = pedal_val is None or pedal_val <= 1
 
         if r["delta"] > 0:
-            clasifs.append("🟢 Carga de combustible")
+            clasifs.append("🟢 CARGA DE COMBUSTIBLE")
             maps.append(maps_pin_url(r["_lat"], r["_lon"]))
         else:
             if detenido and dur_ok and pedal_quieto:
-                clasifs.append("🔴 Posible robo de combustible")
+                clasifs.append("🔴 POSIBLE ROBO DE COMBUSTIBLE")
                 maps.append(maps_pin_url(r["_lat"], r["_lon"]))
             elif detenido and dur_ok:
-                clasifs.append("🟠 Duda / revisar")
+                clasifs.append("🟠 DUDA / REVISAR")
                 maps.append(maps_pin_url(r["_lat"], r["_lon"]))
             else:
                 clasifs.append(None)
@@ -692,45 +702,39 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
     return out, sensor_comb, serie_merge
 
 
-def agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm):
-    if circuitos.empty:
-        return circuitos
-
-    df = circuitos.copy()
-    if serie_comb_merge is None or serie_comb_merge.empty:
-        df["Combustible_consumido_aprox"] = pd.NA
-        return df
-
-    col_fecha = sm["fecha"]
-    col_valor = sm["valor"]
-
-    consumos = []
-    base = serie_comb_merge.copy()
-    base[col_fecha] = pd.to_datetime(base[col_fecha], errors="coerce")
-    base[col_valor] = pd.to_numeric(base[col_valor], errors="coerce")
-
-    for _, c in df.iterrows():
-        ini = pd.to_datetime(c["Inicio"], errors="coerce")
-        fin = pd.to_datetime(c["Fin"], errors="coerce")
-        tramo = base[(base[col_fecha] >= ini) & (base[col_fecha] <= fin)].copy()
-
-        consumo = 0.0
-        if not tramo.empty:
-            inicio_val = tramo[col_valor].iloc[0]
-            fin_val = tramo[col_valor].iloc[-1]
-            if pd.notna(inicio_val) and pd.notna(fin_val):
-                diff = float(inicio_val) - float(fin_val)
-                consumo = round(diff, 2) if diff > 0 else 0.0
-
-        consumos.append(consumo)
-
-    df["Combustible_consumido_aprox"] = consumos
-    return df
-
-
 # =========================================
-# DESVÍOS
+# DESVÍOS Y DETENCIONES FUERA DE BASE
 # =========================================
+def filtrar_detenciones_fuera_de_base(det_fuera, circuitos):
+    if det_fuera.empty:
+        return det_fuera
+
+    rows = []
+    for _, det in det_fuera.iterrows():
+        if det["Duración_min"] <= UMBRAL_DETENCION_MIN:
+            continue
+
+        habitual = False
+        for _, other in det_fuera.iterrows():
+            if other.name == det.name:
+                continue
+            d = haversine_m(det["Lat"], det["Lon"], other["Lat"], other["Lon"])
+            if d is not None and d <= 120:
+                habitual = True
+                break
+
+        if not habitual:
+            row = det.copy()
+            row["Habitual"] = "No"
+            row["Interpretación_operativa"] = "Detención fuera de base no habitual"
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=det_fuera.columns)
+
+    return pd.DataFrame(rows)
+
+
 def detectar_desvios(gps, gm, base, circuitos):
     if base is None or gps.empty:
         return pd.DataFrame()
@@ -772,7 +776,7 @@ def detectar_desvios(gps, gm, base, circuitos):
                 lon_m = tramo["_lon"].mean()
                 dist_base_km = round((haversine_m(lat_m, lon_m, base["lat"], base["lon"]) or 0) / 1000, 2)
 
-                ubic = tramo["_ubicacion_texto"].mode().iloc[0] if not tramo["_ubicacion_texto"].dropna().empty else ""
+                ubic = direccion_mode(tramo["_direccion_raw"])
                 habitual = ubic in habituales if ubic else False
 
                 if dist_base_km > 1 and not habitual:
@@ -796,54 +800,11 @@ def detectar_desvios(gps, gm, base, circuitos):
 
 
 # =========================================
-# FILTRO FINAL DE DETENCIONES FUERA DE BASE
-# =========================================
-def filtrar_detenciones_fuera_de_base(det_fuera, circuitos):
-    if det_fuera.empty:
-        return det_fuera
-
-    habituales = set()
-    if not circuitos.empty:
-        circ_hab = circuitos[circuitos["Tipo_circuito"] == "Habitual"]
-        for _, c in circ_hab.iterrows():
-            if pd.notna(c["Punto_inicio"]):
-                habituales.add(str(c["Punto_inicio"]).strip())
-            if pd.notna(c["Punto_final"]):
-                habituales.add(str(c["Punto_final"]).strip())
-
-    rows = []
-    for _, det in det_fuera.iterrows():
-        if det["Duración_min"] <= UMBRAL_DETENCION_MIN:
-            continue
-
-        # detención habitual si está cerca de otra detención repetida
-        habitual = False
-        for _, other in det_fuera.iterrows():
-            if other.name == det.name:
-                continue
-            d = haversine_m(det["Lat"], det["Lon"], other["Lat"], other["Lon"])
-            if d is not None and d <= 120:
-                habitual = True
-                break
-
-        if not habitual:
-            row = det.copy()
-            row["Habitual"] = "No"
-            row["Interpretación_operativa"] = "Detención fuera de base no habitual"
-            rows.append(row)
-
-    if not rows:
-        return pd.DataFrame(columns=det_fuera.columns)
-
-    return pd.DataFrame(rows)
-
-
-# =========================================
 # PATRONES DE CHOFER
 # =========================================
 def detectar_patrones_chofer(circuitos):
     if circuitos.empty:
-        return "<p>No fue posible detectar patrones.</p>", pd.DataFrame()
+        return "<p class='empty-text'>Sin patrones suficientes.</p>", pd.DataFrame()
 
     df = circuitos.copy()
 
@@ -907,9 +868,9 @@ def detectar_patrones_chofer(circuitos):
     resumen["Duración_promedio_hm"] = resumen["Duración_promedio"].apply(fmt_duracion_min)
 
     texto = """
-    <p>
+    <p class="helper-text">
         Se identificaron agrupaciones operativas compatibles con posibles distintos choferes o turnos.
-        Esta clasificación es inferencial y se basa en horario de salida, velocidad media y duración del circuito.
+        La clasificación es inferencial y se basa en horario de salida, velocidad media y duración del circuito.
     </p>
     """
     return texto, resumen
@@ -933,40 +894,41 @@ def build_pdf(report):
     title = ParagraphStyle(
         "TitleRT",
         parent=styles["Title"],
-        textColor=colors.HexColor("#18324a"),
+        textColor=colors.HexColor("#12395b"),
         fontSize=22,
         leading=26,
-        spaceAfter=10
+        spaceAfter=12,
+        alignment=1
     )
     h2 = ParagraphStyle(
         "H2RT",
         parent=styles["Heading2"],
-        textColor=colors.HexColor("#24557a"),
-        fontSize=14,
-        leading=18,
-        spaceBefore=10,
-        spaceAfter=8
+        textColor=colors.HexColor("#12395b"),
+        fontSize=15,
+        leading=20,
+        spaceBefore=12,
+        spaceAfter=10,
+        alignment=1
     )
     body = styles["BodyText"]
     body.leading = 14
 
     story = []
-    story.append(Paragraph("Informe Técnico de Auditoría de Flota", title))
+    story.append(Paragraph("INFORME TÉCNICO DE AUDITORÍA DE FLOTA", title))
     story.append(Paragraph(report["subtitle"], body))
     story.append(Spacer(1, 8))
 
-    resumen = report["resumen"]
-    story.append(Paragraph("1. Resumen Ejecutivo", h2))
-    for k, v in resumen.items():
+    story.append(Paragraph("RESUMEN", h2))
+    for k, v in report["resumen"].items():
         story.append(Paragraph(f"<b>{escape(str(k))}:</b> {escape(str(v))}", body))
 
     sections = [
-        ("2. Base operativa", report["base"]),
-        ("3. Circuitos de trabajo", report["circuitos"]),
-        ("4. Detenciones fuera de base", report["detenciones"]),
-        ("5. Detección de desvíos", report["desvios"]),
-        ("6. Auditoría de combustible", report["combustible"]),
-        ("7. Patrones de conducción", report["patrones"]),
+        ("BASE OPERATIVA", report["base"]),
+        ("CIRCUITOS DE TRABAJO", report["circuitos"]),
+        ("DETENCIONES FUERA DE BASE", report["detenciones"]),
+        ("DETECCIÓN DE DESVÍOS", report["desvios"]),
+        ("AUDITORÍA DE COMBUSTIBLE", report["combustible"]),
+        ("PATRONES DE CONDUCCIÓN", report["patrones"]),
     ]
 
     for title_txt, data in sections:
@@ -1011,7 +973,7 @@ def download_pdf(report_id):
         pdf,
         mimetype="application/pdf",
         as_attachment=True,
-        download_name="auditoria_flota.pdf"
+        download_name="auditoria_flota_resumen.pdf"
     )
 
 
@@ -1024,9 +986,12 @@ def index():
         try:
             if "sensores" not in request.files or "historico" not in request.files:
                 return """
-                <h3>Error: faltan archivos</h3>
-                <p>Subí ambos archivos: sensores e histórico GPS.</p>
-                <a href="/">Volver</a>
+                <html><head><meta charset="utf-8"></head>
+                <body style="font-family: Arial; margin: 24px;">
+                    <h3>Error: faltan archivos</h3>
+                    <p>Subí ambos archivos: sensores e histórico GPS.</p>
+                    <a href="/">Volver</a>
+                </body></html>
                 """
 
             sensores = request.files["sensores"]
@@ -1077,6 +1042,7 @@ def index():
             det_fuera = filtrar_detenciones_fuera_de_base(det_fuera, circuitos)
 
             eventos_comb, sensor_comb, serie_comb_merge = detectar_eventos_combustible(sens, sm, gps, gm)
+
             consumo_total = "No disponible"
             if serie_comb_merge is not None and not serie_comb_merge.empty:
                 col_valor = sm["valor"]
@@ -1085,22 +1051,20 @@ def index():
                     diff_total = float(serie_tmp.iloc[0]) - float(serie_tmp.iloc[-1])
                     consumo_total = round(diff_total, 2) if diff_total > 0 else 0.0
 
-            circuitos = agregar_consumo_a_circuitos(circuitos, serie_comb_merge, sm)
             desvios = detectar_desvios(gps, gm, base, circuitos)
             patrones_texto, patrones_df = detectar_patrones_chofer(circuitos)
 
             if base:
                 base_html = (
                     f'<div class="callout">'
-                    f'<div><b>Ubicación base:</b> {escape(str(base["maps"]))}</div>'
-                    f'<div><b>Duración de permanencia:</b> {fmt_duracion_min(base["duracion_min"])}</div>'
-                    f'<div><a href="{base["maps"]}" target="_blank">Abrir ubicación en Google Maps</a></div>'
+                    f'<div><span class="label-mini">DIRECCIÓN BASE</span><br>{escape(str(base["direccion"]))}</div>'
+                    f'<div style="margin-top:8px;"><span class="label-mini">PERMANENCIA</span><br>{fmt_duracion_min(base["duracion_min"])}</div>'
+                    f'<div style="margin-top:10px;"><a href="{base["maps"]}" target="_blank">Abrir ubicación en Google Maps</a></div>'
                     f'</div>'
                 )
             else:
-                base_html = "<p>No fue posible identificar base operativa.</p>"
+                base_html = '<p class="empty-text">No fue posible identificar base operativa.</p>'
 
-            # tablas html visibles
             circuitos_html = circuitos[[
                 "Circuito", "Inicio", "Fin", "Duración", "Km", "Tipo_circuito",
                 "Punto_inicio", "Punto_final",
@@ -1120,10 +1084,32 @@ def index():
                 "Duración_evento", "Google_Maps", "Clasificación"
             ]].copy() if not eventos_comb.empty else pd.DataFrame()
 
-            # cache para pdf
             report_id = str(uuid.uuid4())
+
+            base_pdf = pd.DataFrame([{
+                "Dirección base": str(base["direccion"]) if base else "No disponible",
+                "Duración de permanencia": fmt_duracion_min(base["duracion_min"]) if base else "No disponible"
+            }])
+
+            circuitos_pdf = circuitos_html.copy() if not circuitos_html.empty else pd.DataFrame()
+            for col in ["Google_Maps_Inicio", "Google_Maps_Final", "Google_Maps_Recorrido"]:
+                if col in circuitos_pdf.columns:
+                    circuitos_pdf.drop(columns=[col], inplace=True)
+
+            detenciones_pdf = det_fuera_html.copy() if not det_fuera_html.empty else pd.DataFrame()
+            if "Google_Maps" in detenciones_pdf.columns:
+                detenciones_pdf.drop(columns=["Google_Maps"], inplace=True)
+
+            desvios_pdf = desvios_html.copy() if not desvios_html.empty else pd.DataFrame()
+            if "Google_Maps" in desvios_pdf.columns:
+                desvios_pdf.drop(columns=["Google_Maps"], inplace=True)
+
+            combustible_pdf = combustible_html.copy() if not combustible_html.empty else pd.DataFrame()
+            if "Google_Maps" in combustible_pdf.columns:
+                combustible_pdf.drop(columns=["Google_Maps"], inplace=True)
+
             REPORT_CACHE[report_id] = {
-                "subtitle": "Análisis cruzado entre histórico GPS y sensores del vehículo.",
+                "subtitle": "Resumen ejecutivo de auditoría técnica de flota.",
                 "resumen": {
                     "Período analizado": f"{fmt_fecha(periodo_ini)} - {fmt_fecha(periodo_fin)}",
                     "Distancia total": f"{total_km} km",
@@ -1132,14 +1118,11 @@ def index():
                     "Tiempo detenido": fmt_duracion_min(tiempo_det),
                     "Consumo total de combustible": consumo_total,
                 },
-                "base": pd.DataFrame([{
-                    "Ubicación Maps": base["maps"] if base else "No disponible",
-                    "Duración de permanencia": fmt_duracion_min(base["duracion_min"]) if base else "No disponible"
-                }]),
-                "circuitos": circuitos_html,
-                "detenciones": det_fuera_html,
-                "desvios": desvios_html,
-                "combustible": combustible_html,
+                "base": base_pdf,
+                "circuitos": circuitos_pdf,
+                "detenciones": detenciones_pdf,
+                "desvios": desvios_pdf,
+                "combustible": combustible_pdf,
                 "patrones": patrones_df if not patrones_df.empty else "Sin patrones suficientes."
             }
 
@@ -1150,74 +1133,113 @@ def index():
                 <title>Informe de Auditoría de Flota</title>
                 <style>
                     * {{ box-sizing: border-box; }}
+
                     body {{
                         margin: 0;
-                        font-family: Arial, sans-serif;
-                        background: linear-gradient(180deg, #eef4fb 0%, #f8fafc 100%);
-                        color: #102133;
+                        font-family: "Segoe UI", Arial, sans-serif;
+                        background: linear-gradient(180deg, #eef3f8 0%, #f8fafc 100%);
+                        color: #0f172a;
                     }}
+
                     .container {{
-                        max-width: 1280px;
+                        max-width: 1320px;
                         margin: 28px auto;
-                        padding: 20px;
+                        padding: 24px;
                     }}
+
                     .hero {{
-                        background: linear-gradient(135deg, #18324a, #24557a);
+                        background: linear-gradient(135deg, #0f2d46, #1e4d73);
                         color: white;
-                        border-radius: 22px;
-                        padding: 30px;
-                        box-shadow: 0 18px 40px rgba(0,0,0,0.16);
-                        margin-bottom: 22px;
+                        border-radius: 24px;
+                        padding: 34px;
+                        margin-bottom: 24px;
+                        box-shadow: 0 18px 44px rgba(15, 23, 42, 0.18);
                     }}
-                    .hero h1 {{ margin: 0 0 8px; font-size: 30px; }}
-                    .hero p {{ margin: 0; opacity: .95; line-height: 1.55; }}
+
+                    .hero h1 {{
+                        margin: 0 0 10px 0;
+                        font-size: 32px;
+                        font-weight: 800;
+                        letter-spacing: 0.02em;
+                    }}
+
+                    .hero p {{
+                        margin: 0;
+                        line-height: 1.6;
+                        font-size: 15px;
+                        opacity: 0.95;
+                    }}
 
                     .summary-grid {{
                         display: grid;
                         grid-template-columns: repeat(4, 1fr);
-                        gap: 16px;
-                        margin-bottom: 22px;
+                        gap: 18px;
+                        margin-bottom: 26px;
                     }}
+
                     .metric {{
-                        background: white;
-                        border-radius: 18px;
-                        padding: 18px;
-                        box-shadow: 0 8px 24px rgba(15,23,42,.08);
-                        border: 1px solid #e5edf5;
+                        background: rgba(255,255,255,0.92);
+                        backdrop-filter: blur(6px);
+                        border-radius: 20px;
+                        padding: 20px;
+                        border: 1px solid rgba(203, 213, 225, 0.7);
+                        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
                     }}
+
                     .metric .label {{
                         font-size: 12px;
                         color: #64748b;
                         margin-bottom: 8px;
                         text-transform: uppercase;
-                        letter-spacing: .04em;
+                        letter-spacing: 0.08em;
+                        font-weight: 700;
                     }}
+
                     .metric .value {{
                         font-size: 24px;
-                        font-weight: 700;
+                        font-weight: 800;
                         color: #0f172a;
                     }}
 
                     .section {{
-                        background: white;
-                        border-radius: 20px;
-                        padding: 22px;
-                        margin-bottom: 20px;
-                        box-shadow: 0 8px 24px rgba(15,23,42,.08);
-                        border: 1px solid #e5edf5;
+                        background: rgba(255,255,255,0.96);
+                        backdrop-filter: blur(8px);
+                        border-radius: 24px;
+                        padding: 26px;
+                        margin-bottom: 22px;
+                        border: 1px solid rgba(226, 232, 240, 0.85);
+                        box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
                     }}
+
                     .section h2 {{
                         margin-top: 0;
-                        color: #18324a;
-                        border-bottom: 1px solid #e2e8f0;
-                        padding-bottom: 10px;
+                        margin-bottom: 18px;
+                        text-align: center;
+                        font-size: 28px;
+                        font-weight: 800;
+                        color: #12395b;
+                        letter-spacing: 0.06em;
+                        text-transform: uppercase;
+                        border-bottom: 1px solid #dbe3ec;
+                        padding-bottom: 14px;
                     }}
+
                     .callout {{
-                        background: #eff6ff;
-                        border-left: 5px solid #2563eb;
-                        padding: 14px 16px;
-                        border-radius: 12px;
-                        line-height: 1.6;
+                        background: linear-gradient(180deg, #eef6ff 0%, #f8fbff 100%);
+                        border: 1px solid #cfe0f5;
+                        border-left: 6px solid #2563eb;
+                        padding: 16px 18px;
+                        border-radius: 14px;
+                        line-height: 1.7;
+                        color: #16324a;
+                    }}
+
+                    .label-mini {{
+                        font-size: 11px;
+                        color: #64748b;
+                        text-transform: uppercase;
+                        letter-spacing: .08em;
+                        font-weight: 700;
                     }}
 
                     table.report-table {{
@@ -1226,31 +1248,45 @@ def index():
                         border-spacing: 0;
                         margin-top: 14px;
                         overflow: hidden;
-                        border-radius: 14px;
+                        border-radius: 16px;
                     }}
+
                     .report-table thead th {{
-                        background: #18324a;
+                        background: linear-gradient(180deg, #16324a 0%, #1f4e74 100%);
                         color: white;
-                        padding: 11px;
+                        padding: 13px 12px;
                         text-align: left;
-                        font-size: 13px;
+                        font-size: 12px;
+                        text-transform: uppercase;
+                        letter-spacing: 0.05em;
                     }}
+
                     .report-table tbody td {{
                         background: white;
-                        padding: 10px;
+                        padding: 12px 11px;
                         border-bottom: 1px solid #e5e7eb;
                         font-size: 13px;
                         vertical-align: top;
                     }}
+
                     .report-table tbody tr:nth-child(even) td {{
                         background: #f8fafc;
                     }}
+
+                    .report-table tbody tr:hover td {{
+                        background: #eef6ff;
+                        transition: 0.2s ease;
+                    }}
+
                     a {{
                         color: #0f62fe;
                         text-decoration: none;
-                        font-weight: 600;
+                        font-weight: 700;
                     }}
-                    a:hover {{ text-decoration: underline; }}
+
+                    a:hover {{
+                        text-decoration: underline;
+                    }}
 
                     .footer-actions {{
                         display: flex;
@@ -1259,31 +1295,48 @@ def index():
                         margin: 28px 0 40px;
                         flex-wrap: wrap;
                     }}
+
                     .btn {{
                         display: inline-block;
-                        background: #0f62fe;
+                        background: linear-gradient(180deg, #0f62fe 0%, #0b4fd1 100%);
                         color: white;
-                        padding: 13px 18px;
-                        border-radius: 12px;
-                        font-weight: 700;
-                        box-shadow: 0 6px 18px rgba(15,98,254,.22);
+                        padding: 13px 20px;
+                        border-radius: 14px;
+                        font-weight: 800;
+                        box-shadow: 0 8px 20px rgba(15, 98, 254, 0.22);
                     }}
+
                     .btn.secondary {{
-                        background: #18324a;
+                        background: linear-gradient(180deg, #18324a 0%, #10293d 100%);
+                    }}
+
+                    .helper-text,
+                    .empty-text,
+                    p {{
+                        line-height: 1.65;
                     }}
 
                     @media (max-width: 980px) {{
-                        .summary-grid {{ grid-template-columns: repeat(2, 1fr); }}
+                        .summary-grid {{
+                            grid-template-columns: repeat(2, 1fr);
+                        }}
                     }}
+
                     @media (max-width: 640px) {{
-                        .summary-grid {{ grid-template-columns: 1fr; }}
+                        .summary-grid {{
+                            grid-template-columns: 1fr;
+                        }}
+
+                        .section h2 {{
+                            font-size: 22px;
+                        }}
                     }}
                 </style>
             </head>
             <body>
                 <div class="container">
                     <div class="hero">
-                        <h1>Informe Técnico de Auditoría de Flota</h1>
+                        <h1>INFORME TÉCNICO DE AUDITORÍA DE FLOTA</h1>
                         <p>
                             Análisis cruzado entre histórico GPS y sensores del vehículo.
                             Evaluación de base operativa, circuitos, desvíos, combustible y patrones de conducción.
@@ -1292,65 +1345,58 @@ def index():
 
                     <div class="summary-grid">
                         <div class="metric">
-                            <div class="label">Período analizado</div>
+                            <div class="label">PERÍODO ANALIZADO</div>
                             <div class="value" style="font-size:15px;">{fmt_fecha(periodo_ini)}<br>{fmt_fecha(periodo_fin)}</div>
                         </div>
                         <div class="metric">
-                            <div class="label">Distancia total</div>
+                            <div class="label">DISTANCIA TOTAL</div>
                             <div class="value">{total_km} km</div>
                         </div>
                         <div class="metric">
-                            <div class="label">Tiempo en movimiento</div>
+                            <div class="label">TIEMPO EN MOVIMIENTO</div>
                             <div class="value" style="font-size:20px;">{tiempo_mov}</div>
                         </div>
                         <div class="metric">
-                            <div class="label">Consumo total</div>
+                            <div class="label">CONSUMO TOTAL</div>
                             <div class="value">{consumo_total}</div>
                         </div>
                     </div>
 
                     <div class="section">
-                        <h2>1. Resumen Ejecutivo</h2>
-                        <p><b>Velocidad máxima:</b> {vel_max}</p>
-                        <p><b>Tiempo detenido:</b> {fmt_duracion_min(tiempo_det)}</p>
-                        <p><b>Cantidad total de detenciones detectadas:</b> {len(detenciones)}</p>
-                    </div>
-
-                    <div class="section">
-                        <h2>2. Identificación de base operativa</h2>
+                        <h2>BASE OPERATIVA</h2>
                         {base_html}
                     </div>
 
                     <div class="section">
-                        <h2>3. Circuitos de trabajo</h2>
-                        {html_tabla(circuitos_html, index=False) if not circuitos_html.empty else "<p>Sin circuitos detectados.</p>"}
+                        <h2>CIRCUITOS DE TRABAJO</h2>
+                        {html_tabla(circuitos_html, index=False) if not circuitos_html.empty else '<p class="empty-text">Sin circuitos detectados.</p>'}
                     </div>
 
                     <div class="section">
-                        <h2>4. Análisis de detenciones fuera de base</h2>
-                        {html_tabla(det_fuera_html, index=False) if not det_fuera_html.empty else "<p>No se detectaron detenciones fuera de base relevantes.</p>"}
+                        <h2>DETENCIONES FUERA DE BASE</h2>
+                        {html_tabla(det_fuera_html, index=False) if not det_fuera_html.empty else '<p class="empty-text">No se detectaron detenciones fuera de base relevantes.</p>'}
                     </div>
 
                     <div class="section">
-                        <h2>5. Detección de desvíos</h2>
-                        {html_tabla(desvios_html, index=False) if not desvios_html.empty else "<p>No se detectaron desvíos relevantes con la configuración actual.</p>"}
+                        <h2>DETECCIÓN DE DESVÍOS</h2>
+                        {html_tabla(desvios_html, index=False) if not desvios_html.empty else '<p class="empty-text">No se detectaron desvíos relevantes con la configuración actual.</p>'}
                     </div>
 
                     <div class="section">
-                        <h2>6. Auditoría de combustible</h2>
+                        <h2>AUDITORÍA DE COMBUSTIBLE</h2>
                         <p><b>Sensor utilizado:</b> {escape(str(sensor_comb)) if sensor_comb else "No detectado"}</p>
-                        {html_tabla(combustible_html, index=False) if not combustible_html.empty else "<p>No se detectaron eventos de combustible relevantes.</p>"}
+                        {html_tabla(combustible_html, index=False) if not combustible_html.empty else '<p class="empty-text">No se detectaron eventos de combustible relevantes.</p>'}
                     </div>
 
                     <div class="section">
-                        <h2>7. Patrones de conducción / posibles distintos choferes</h2>
+                        <h2>PATRONES DE CONDUCCIÓN</h2>
                         {patrones_texto}
-                        {html_tabla(patrones_df, index=False) if not patrones_df.empty else "<p>Sin patrones suficientes.</p>"}
+                        {html_tabla(patrones_df, index=False) if not patrones_df.empty else '<p class="empty-text">Sin patrones suficientes.</p>'}
                     </div>
 
                     <div class="footer-actions">
-                        <a class="btn" href="/pdf/{report_id}" target="_blank">Descargar PDF</a>
-                        <a class="btn secondary" href="/">Nueva auditoría</a>
+                        <a class="btn" href="/pdf/{report_id}" target="_blank">DESCARGAR PDF</a>
+                        <a class="btn secondary" href="/">NUEVA AUDITORÍA</a>
                     </div>
                 </div>
             </body>
@@ -1377,80 +1423,108 @@ def index():
         <title>Auditoría técnica de flota</title>
         <style>
             * { box-sizing: border-box; }
+
             body {
                 margin: 0;
-                font-family: Arial, sans-serif;
-                background: linear-gradient(180deg, #eef4fb 0%, #f8fafc 100%);
-                color: #102133;
+                font-family: "Segoe UI", Arial, sans-serif;
+                background: linear-gradient(180deg, #eef3f8 0%, #f8fafc 100%);
+                color: #0f172a;
             }
+
             .wrapper {
                 max-width: 980px;
                 margin: 42px auto;
                 padding: 24px;
             }
+
             .hero {
-                background: linear-gradient(135deg, #18324a, #24557a);
+                background: linear-gradient(135deg, #0f2d46, #1e4d73);
                 color: white;
-                border-radius: 22px;
+                border-radius: 24px;
                 padding: 34px;
-                box-shadow: 0 16px 40px rgba(0,0,0,0.16);
                 margin-bottom: 24px;
+                box-shadow: 0 18px 44px rgba(15, 23, 42, 0.18);
             }
+
             .hero h1 {
                 margin: 0 0 10px 0;
                 font-size: 32px;
+                font-weight: 800;
+                letter-spacing: 0.02em;
             }
+
             .hero p {
                 margin: 0;
                 line-height: 1.6;
-                opacity: .95;
+                font-size: 15px;
+                opacity: 0.95;
             }
+
             .card {
-                background: white;
-                border-radius: 20px;
-                padding: 26px;
-                box-shadow: 0 8px 24px rgba(15,23,42,.08);
-                border: 1px solid #e5edf5;
+                background: rgba(255,255,255,0.96);
+                border-radius: 24px;
+                padding: 28px;
+                box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+                border: 1px solid rgba(226, 232, 240, 0.85);
             }
+
             .card h2 {
                 margin-top: 0;
-                color: #18324a;
+                text-align: center;
+                font-size: 28px;
+                font-weight: 800;
+                color: #12395b;
+                letter-spacing: 0.06em;
+                text-transform: uppercase;
+                border-bottom: 1px solid #dbe3ec;
+                padding-bottom: 14px;
             }
+
             .form-grid {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
                 gap: 18px;
                 margin-top: 18px;
             }
+
             .field {
                 display: flex;
                 flex-direction: column;
                 gap: 8px;
             }
+
             .field label {
-                font-weight: bold;
+                font-weight: 700;
                 color: #334155;
+                text-transform: uppercase;
+                font-size: 12px;
+                letter-spacing: .06em;
             }
+
             input[type="file"] {
                 padding: 12px;
                 border: 1px solid #cbd5e1;
-                border-radius: 10px;
+                border-radius: 12px;
                 background: #f8fafc;
             }
+
             .actions {
                 margin-top: 24px;
+                text-align: center;
             }
+
             input[type="submit"] {
-                background: #0f62fe;
+                background: linear-gradient(180deg, #0f62fe 0%, #0b4fd1 100%);
                 color: white;
                 border: none;
-                border-radius: 12px;
+                border-radius: 14px;
                 padding: 14px 22px;
                 font-size: 15px;
-                font-weight: bold;
+                font-weight: 800;
                 cursor: pointer;
-                box-shadow: 0 6px 18px rgba(15,98,254,.22);
+                box-shadow: 0 8px 20px rgba(15,98,254,.22);
             }
+
             .help {
                 margin-top: 18px;
                 padding: 14px 16px;
@@ -1460,16 +1534,18 @@ def index():
                 color: #1e3a5f;
                 line-height: 1.6;
             }
+
             @media (max-width: 768px) {
                 .form-grid { grid-template-columns: 1fr; }
                 .hero h1 { font-size: 26px; }
+                .card h2 { font-size: 22px; }
             }
         </style>
     </head>
     <body>
         <div class="wrapper">
             <div class="hero">
-                <h1>Auditoría técnica de flota</h1>
+                <h1>INFORME TÉCNICO DE AUDITORÍA DE FLOTA</h1>
                 <p>
                     Plataforma de análisis cruzado entre histórico GPS y sensores.
                     Identifica base operativa, circuitos habituales y anómalos,
@@ -1478,7 +1554,7 @@ def index():
             </div>
 
             <div class="card">
-                <h2>Cargar archivos</h2>
+                <h2>CARGA DE ARCHIVOS</h2>
                 <form method="post" enctype="multipart/form-data">
                     <div class="form-grid">
                         <div class="field">
@@ -1492,7 +1568,7 @@ def index():
                     </div>
 
                     <div class="actions">
-                        <input type="submit" value="Generar auditoría">
+                        <input type="submit" value="GENERAR AUDITORÍA">
                     </div>
                 </form>
 

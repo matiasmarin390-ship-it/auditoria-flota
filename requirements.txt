@@ -1,7 +1,4 @@
 flask
 pandas
-numpy
-gunicorn
 openpyxl
-xlrd
-reportlab
+pdfplumber

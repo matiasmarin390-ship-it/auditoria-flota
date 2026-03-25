@@ -3,7 +3,6 @@ import pandas as pd
 import io
 import math
 import uuid
-import json
 from html import escape
 from urllib.parse import urlencode
 
@@ -111,12 +110,6 @@ def fmt_fecha(x):
     if pd.isna(x):
         return "-"
     return pd.to_datetime(x).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def fmt_fecha_dia(x):
-    if pd.isna(x):
-        return "-"
-    return pd.to_datetime(x).strftime("%Y-%m-%d")
 
 
 def fmt_duracion_min(mins):
@@ -486,13 +479,10 @@ def reconstruir_circuitos(gps, gm, base):
                 lat_prom = tramo["_lat"].mean()
                 lon_prom = tramo["_lon"].mean()
 
-                direccion_grafico = f"{dir_ini} → {dir_fin}"
-
                 circuitos.append([
                     nro, ini, fin, round(dur_min, 2), fmt_duracion_min(dur_min), km,
                     dir_ini, dir_fin, maps_inicio, maps_final, maps_circuito,
-                    vel_prom, puntos_detenidos, hora_salida, lat_prom, lon_prom,
-                    fmt_fecha_dia(ini), direccion_grafico
+                    vel_prom, puntos_detenidos, hora_salida, lat_prom, lon_prom
                 ])
 
             en_circuito = False
@@ -502,8 +492,7 @@ def reconstruir_circuitos(gps, gm, base):
         "Punto_inicio", "Punto_final",
         "Google_Maps_Inicio", "Google_Maps_Final", "Google_Maps_Recorrido",
         "Velocidad_promedio", "Puntos_detenidos", "Hora_salida",
-        "_Lat_centro", "_Lon_centro",
-        "Día", "Dirección_grafico"
+        "_Lat_centro", "_Lon_centro"
     ])
 
     if not df.empty:
@@ -1057,16 +1046,6 @@ def index():
                 "Duración_evento", "Google_Maps", "Clasificación"
             ]].copy() if not eventos_comb.empty else pd.DataFrame()
 
-            circuitos_chart = []
-            if not circuitos.empty:
-                chart_df = circuitos[["Día", "Dirección_grafico", "Km"]].copy()
-                for _, r in chart_df.iterrows():
-                    label = f'{r["Día"]} | {r["Dirección_grafico"]}'
-                    circuitos_chart.append({
-                        "label": label,
-                        "km": float(r["Km"]) if pd.notna(r["Km"]) else 0
-                    })
-
             report_id = str(uuid.uuid4())
 
             base_pdf = pd.DataFrame([{
@@ -1111,14 +1090,11 @@ def index():
                 "patrones": patrones_df if not patrones_df.empty else "Sin patrones suficientes."
             }
 
-            chart_json = json.dumps(circuitos_chart, ensure_ascii=False)
-
             html = f"""
             <html>
             <head>
                 <meta charset="utf-8">
                 <title>Informe de Auditoría de Flota</title>
-                <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
                 <style>
                     * {{ box-sizing: border-box; }}
 
@@ -1163,7 +1139,7 @@ def index():
 
                     .summary-grid {{
                         display: grid;
-                        grid-template-columns: repeat(3, 1fr);
+                        grid-template-columns: repeat(2, 1fr);
                         gap: 18px;
                         margin-bottom: 26px;
                     }}
@@ -1238,23 +1214,6 @@ def index():
                         text-transform: uppercase;
                         letter-spacing: .04em;
                         font-weight: 700;
-                    }}
-
-                    .chart-card {{
-                        background: linear-gradient(180deg, #f8fbff 0%, #ffffff 100%);
-                        border: 1px solid #dbe7f3;
-                        border-radius: 18px;
-                        padding: 18px;
-                        margin-bottom: 18px;
-                    }}
-
-                    .chart-title {{
-                        font-size: 14px;
-                        font-weight: 800;
-                        text-transform: uppercase;
-                        letter-spacing: .05em;
-                        color: #1f4e74;
-                        margin-bottom: 12px;
                     }}
 
                     table.report-table {{
@@ -1363,10 +1322,6 @@ def index():
                             <div class="label">DISTANCIA TOTAL</div>
                             <div class="value">{total_km} km</div>
                         </div>
-                        <div class="metric">
-                            <div class="label">TIEMPO EN MOVIMIENTO</div>
-                            <div class="value" style="font-size:20px;">{tiempo_mov}</div>
-                        </div>
                     </div>
 
                     <div class="section">
@@ -1376,10 +1331,6 @@ def index():
 
                     <div class="section">
                         <h2>CIRCUITOS DE TRABAJO</h2>
-                        <div class="chart-card">
-                            <div class="chart-title">GRÁFICO DIARIO DE DIRECCIÓN Y KM RECORRIDOS</div>
-                            <canvas id="circuitosChart" height="120"></canvas>
-                        </div>
                         {html_tabla(circuitos_html, index=False) if not circuitos_html.empty else '<p class="empty-text">Sin circuitos detectados.</p>'}
                     </div>
 
@@ -1410,52 +1361,6 @@ def index():
                         <a class="btn secondary" href="/">NUEVA AUDITORÍA</a>
                     </div>
                 </div>
-
-                <script>
-                    const circuitosData = {chart_json};
-                    const ctx = document.getElementById('circuitosChart');
-
-                    if (ctx && circuitosData.length > 0) {{
-                        new Chart(ctx, {{
-                            type: 'bar',
-                            data: {{
-                                labels: circuitosData.map(x => x.label),
-                                datasets: [{{
-                                    label: 'KM RECORRIDOS',
-                                    data: circuitosData.map(x => x.km),
-                                    backgroundColor: 'rgba(31, 78, 116, 0.85)',
-                                    borderColor: 'rgba(15, 45, 70, 1)',
-                                    borderWidth: 1,
-                                    borderRadius: 8
-                                }}]
-                            }},
-                            options: {{
-                                responsive: true,
-                                maintainAspectRatio: false,
-                                plugins: {{
-                                    legend: {{
-                                        display: true
-                                    }}
-                                }},
-                                scales: {{
-                                    x: {{
-                                        ticks: {{
-                                            maxRotation: 70,
-                                            minRotation: 70
-                                        }}
-                                    }},
-                                    y: {{
-                                        beginAtZero: true,
-                                        title: {{
-                                            display: true,
-                                            text: 'KM'
-                                        }}
-                                    }}
-                                }}
-                            }}
-                        }});
-                    }}
-                </script>
             </body>
             </html>
             """

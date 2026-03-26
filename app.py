@@ -1,29 +1,32 @@
-from flask import Flask, request, render_template_string
-import pandas as pd
+import os
 import io
 import re
 from math import radians, cos, sin, asin, sqrt
 
-# PDF
+from flask import Flask, request
+import pandas as pd
+
+# Import protegido para que la app arranque aunque falte la librería
 try:
     import pdfplumber
+    PDFPLUMBER_OK = True
 except Exception:
     pdfplumber = None
+    PDFPLUMBER_OK = False
 
 app = Flask(__name__)
 
-# =========================
+# =========================================
 # CONFIG
-# =========================
+# =========================================
 STOP_DISTANCE_METERS = 10
 STOP_MINUTES = 3
-MATCH_DISTANCE_METERS = 10
 BASE_RADIUS_METERS = 100
 
 
-# =========================
+# =========================================
 # UTILS
-# =========================
+# =========================================
 def haversine(lat1, lon1, lat2, lon2):
     if pd.isna(lat1) or pd.isna(lon1) or pd.isna(lat2) or pd.isna(lon2):
         return None
@@ -31,7 +34,7 @@ def haversine(lat1, lon1, lat2, lon2):
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
     a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    return 2 * r * asin(sqrt(a))
+    return 2 * r * asin(a ** 0.5)
 
 
 def fmt_dt(x):
@@ -50,7 +53,7 @@ def fmt_minutes(m):
 
 
 def normalize_text(s):
-    if s is None:
+    if s is None or pd.isna(s):
         return ""
     return str(s).strip()
 
@@ -65,10 +68,28 @@ def find_col(df, candidates):
     return None
 
 
-# =========================
-# FILE READERS
-# =========================
+def html_error(title, message, back="/"):
+    return f"""
+    <html>
+    <head><meta charset="utf-8"><title>Error</title></head>
+    <body style="font-family:Arial; margin:24px; background:#f4f7fb;">
+        <div style="max-width:900px; margin:auto; background:white; padding:24px; border-radius:18px; box-shadow:0 8px 24px rgba(15,23,42,.08);">
+            <h2 style="color:#12395b;">{title}</h2>
+            <pre style="white-space:pre-wrap; font-family:Consolas, monospace; background:#f8fafc; padding:16px; border-radius:12px;">{message}</pre>
+            <p><a href="{back}" style="color:#0f62fe; font-weight:bold;">Volver</a></p>
+        </div>
+    </body>
+    </html>
+    """
+
+
+# =========================================
+# LECTURA DE ARCHIVOS
+# =========================================
 def read_dataframe(upload):
+    if upload is None or upload.filename == "":
+        raise Exception("No se recibió el archivo histórico.")
+
     name = (upload.filename or "").lower()
 
     if name.endswith(".xlsx") or name.endswith(".xls"):
@@ -78,7 +99,7 @@ def read_dataframe(upload):
     upload.seek(0)
     raw = upload.read()
 
-    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
+    for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1", "iso-8859-1"]:
         try:
             text = raw.decode(enc)
         except Exception:
@@ -96,8 +117,8 @@ def read_dataframe(upload):
 
 
 def extract_text_from_pdf(upload):
-    if pdfplumber is None:
-        raise Exception("Falta instalar pdfplumber. Agregalo al requirements.txt")
+    if not PDFPLUMBER_OK:
+        raise Exception("Falta instalar pdfplumber en requirements.txt")
 
     upload.seek(0)
     text_parts = []
@@ -110,22 +131,19 @@ def extract_text_from_pdf(upload):
     return "\n".join(text_parts)
 
 
-# =========================
-# ROUTE SHEET PARSER
-# =========================
-def extract_addresses_from_route_pdf(upload):
-    text = extract_text_from_pdf(upload)
-
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
+# =========================================
+# EXTRAER DIRECCIONES DE VARIAS HOJAS DE RUTA
+# =========================================
+def extract_addresses_from_route_pdfs(upload_list):
     results = []
 
-    # patrón simple: nombre + domicilio + localidad + remito
-    # ejemplo real del PDF: Murguiondo 3205 Villa Lugano
+    if not upload_list:
+        return pd.DataFrame(columns=["hoja", "direccion_hoja", "localidad_hoja", "texto_completo"])
+
     street_re = re.compile(
         r'([A-Za-zÁÉÍÓÚáéíóúÑñüÜ0-9.\- ]+?\s\d{1,5})\s+([A-Za-zÁÉÍÓÚáéíóúÑñüÜ .]+)$'
     )
 
-    # filtramos ruido
     blacklist = [
         "impresión de hoja de ruta",
         "total viaje",
@@ -144,33 +162,46 @@ def extract_addresses_from_route_pdf(upload):
         "hoja:"
     ]
 
-    for line in lines:
-        low = line.lower()
-        if any(b in low for b in blacklist):
+    for up in upload_list:
+        if up is None or up.filename == "":
             continue
 
-        if "r-" in low:
-            # recorto antes del remito si aparece
-            line = re.split(r'\sR-\d+', line, maxsplit=1)[0].strip()
+        filename = up.filename
+        text = extract_text_from_pdf(up)
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-        if not any(ch.isdigit() for ch in line):
-            continue
+        for line in lines:
+            low = line.lower()
 
-        m = street_re.search(line)
-        if m:
-            address = normalize_text(m.group(1))
-            locality = normalize_text(m.group(2))
-            results.append({
-                "direccion_hoja": address,
-                "localidad_hoja": locality,
-                "texto_completo": f"{address} - {locality}"
-            })
+            if any(b in low for b in blacklist):
+                continue
 
-    # deduplicar
+            if "r-" in low:
+                line = re.split(r'\sR-\d+', line, maxsplit=1)[0].strip()
+
+            if not any(ch.isdigit() for ch in line):
+                continue
+
+            m = street_re.search(line)
+            if m:
+                address = normalize_text(m.group(1))
+                locality = normalize_text(m.group(2))
+
+                results.append({
+                    "hoja": filename,
+                    "direccion_hoja": address,
+                    "localidad_hoja": locality,
+                    "texto_completo": f"{address} - {locality}"
+                })
+
     dedup = []
     seen = set()
     for r in results:
-        key = (r["direccion_hoja"].lower(), r["localidad_hoja"].lower())
+        key = (
+            r["hoja"].lower(),
+            r["direccion_hoja"].lower(),
+            r["localidad_hoja"].lower()
+        )
         if key not in seen:
             dedup.append(r)
             seen.add(key)
@@ -178,9 +209,9 @@ def extract_addresses_from_route_pdf(upload):
     return pd.DataFrame(dedup)
 
 
-# =========================
-# GPS PREP
-# =========================
+# =========================================
+# PREPARAR GPS
+# =========================================
 def prepare_gps(df):
     col_fecha = find_col(df, ["fecha", "datetime", "time"])
     col_lat = find_col(df, ["latitud", "latitude", "lat"])
@@ -224,9 +255,9 @@ def prepare_gps(df):
     return gps
 
 
-# =========================
-# STOP DETECTION
-# =========================
+# =========================================
+# DETECTAR PARADAS
+# =========================================
 def detect_stops(gps):
     gps = gps.copy()
     gps["_grp"] = (gps["_detenido"] != gps["_detenido"].shift()).cumsum()
@@ -241,6 +272,11 @@ def detect_stops(gps):
         mins = (fin - ini).total_seconds() / 60
 
         if mins >= STOP_MINUTES:
+            direction = ""
+            if "_direccion" in g.columns:
+                mode = g["_direccion"].mode()
+                direction = normalize_text(mode.iloc[0]) if not mode.empty else ""
+
             stops.append({
                 "inicio": ini,
                 "fin": fin,
@@ -248,7 +284,7 @@ def detect_stops(gps):
                 "duracion": fmt_minutes(mins),
                 "lat": g["_lat"].mean(),
                 "lon": g["_lon"].mean(),
-                "direccion_gps": normalize_text(g["_direccion"].mode().iloc[0]) if not g["_direccion"].mode().empty else "",
+                "direccion_gps": direction,
             })
 
     return pd.DataFrame(stops)
@@ -280,9 +316,9 @@ def detect_last_point(gps):
     }
 
 
-# =========================
-# MATCHES
-# =========================
+# =========================================
+# COMPARAR HOJAS VS PARADAS
+# =========================================
 def compare_route_vs_stops(route_df, stops_df):
     if route_df.empty:
         return pd.DataFrame()
@@ -298,21 +334,26 @@ def compare_route_vs_stops(route_df, stops_df):
     rows = []
     for _, rr in route_df.iterrows():
         expected = rr["direccion_hoja"].lower()
+        locality = rr["localidad_hoja"].lower()
         matched = None
 
-        # comparación textual simple contra dirección GPS
         for _, sp in stops_df.iterrows():
             gps_dir = normalize_text(sp["direccion_gps"]).lower()
-            if gps_dir and (
+
+            if not gps_dir:
+                continue
+
+            if (
                 expected in gps_dir or
                 gps_dir in expected or
-                rr["localidad_hoja"].lower() in gps_dir
+                locality in gps_dir
             ):
                 matched = sp
                 break
 
         if matched is not None:
             rows.append({
+                "hoja": rr["hoja"],
                 "direccion_hoja": rr["direccion_hoja"],
                 "localidad_hoja": rr["localidad_hoja"],
                 "estado": "🟢 COINCIDE",
@@ -322,6 +363,7 @@ def compare_route_vs_stops(route_df, stops_df):
             })
         else:
             rows.append({
+                "hoja": rr["hoja"],
                 "direccion_hoja": rr["direccion_hoja"],
                 "localidad_hoja": rr["localidad_hoja"],
                 "estado": "🔴 NO COINCIDE",
@@ -333,8 +375,52 @@ def compare_route_vs_stops(route_df, stops_df):
     return pd.DataFrame(rows)
 
 
+def detect_post_last_delivery(compare_df, stops_df, base):
+    matched_rows = compare_df[compare_df["estado"].str.contains("COINCIDE", na=False)].copy() if not compare_df.empty else pd.DataFrame()
+    if matched_rows.empty or stops_df.empty:
+        return {
+            "ultimo_reparto": "-",
+            "destino_posterior": "-",
+            "volvio_a_base": "No determinable"
+        }
+
+    matched_rows["hora_parada_dt"] = pd.to_datetime(matched_rows["hora_parada"], errors="coerce")
+    matched_rows = matched_rows.dropna(subset=["hora_parada_dt"])
+    if matched_rows.empty:
+        return {
+            "ultimo_reparto": "-",
+            "destino_posterior": "-",
+            "volvio_a_base": "No determinable"
+        }
+
+    last_delivery = matched_rows.sort_values("hora_parada_dt").iloc[-1]
+    after = stops_df[pd.to_datetime(stops_df["inicio"]) > last_delivery["hora_parada_dt"]].copy()
+
+    if after.empty:
+        return {
+            "ultimo_reparto": f'{last_delivery["direccion_hoja"]} - {last_delivery["localidad_hoja"]}',
+            "destino_posterior": "No se detectaron nuevas paradas luego del último reparto",
+            "volvio_a_base": "No"
+        }
+
+    next_stop = after.sort_values("inicio").iloc[0]
+    post_dest = next_stop["direccion_gps"] if next_stop["direccion_gps"] else "Parada sin dirección"
+
+    volvió = "No"
+    if base:
+        dist = haversine(next_stop["lat"], next_stop["lon"], base["lat"], base["lon"])
+        if dist is not None and dist <= BASE_RADIUS_METERS:
+            volvió = "Sí"
+
+    return {
+        "ultimo_reparto": f'{last_delivery["direccion_hoja"]} - {last_delivery["localidad_hoja"]}',
+        "destino_posterior": post_dest,
+        "volvio_a_base": volvió
+    }
+
+
 # =========================
-# HTML TEMPLATES
+# HTML
 # =========================
 HOME_HTML = """
 <!DOCTYPE html>
@@ -441,7 +527,6 @@ COMBUSTIBLE_HTML = """
     <div class="card">
         <h1>ANÁLISIS DE COMBUSTIBLE</h1>
         <p>Este módulo queda reservado para integrar el análisis de combustible que ya venías usando.</p>
-        <p>Si querés, en el siguiente paso lo fusiono con el módulo de paradas dentro de este mismo archivo.</p>
         <p><a href="/">Volver</a></p>
     </div>
 </div>
@@ -517,8 +602,8 @@ PARADAS_FORM_HTML = """
                 <input type="file" name="gps" required>
             </div>
             <div class="field">
-                <label>Hoja de ruta en PDF</label>
-                <input type="file" name="hoja" required>
+                <label>Hojas de ruta en PDF (podés subir varias)</label>
+                <input type="file" name="hojas" multiple required>
             </div>
             <input type="submit" value="PROCESAR ANÁLISIS">
         </form>
@@ -530,8 +615,9 @@ PARADAS_FORM_HTML = """
 """
 
 
-def render_paradas_result(route_df, stops_df, compare_df, base, last_point):
-    route_table = route_df.to_html(index=False, border=0) if not route_df.empty else "<p>No se detectaron direcciones en la hoja.</p>"
+def render_paradas_result(route_df, stops_df, compare_df, base, last_point, post_info):
+    route_table = route_df.to_html(index=False, border=0) if not route_df.empty else "<p>No se detectaron direcciones en las hojas.</p>"
+
     stops_show = stops_df[["inicio", "fin", "duracion", "direccion_gps"]].copy() if not stops_df.empty else pd.DataFrame()
     if not stops_show.empty:
         stops_show.columns = ["Inicio", "Fin", "Duración", "Dirección detectada"]
@@ -548,6 +634,12 @@ def render_paradas_result(route_df, stops_df, compare_df, base, last_point):
     last_html = f"""
     <p><b>Último punto real del camión:</b> {escape(last_point["direccion"]) if last_point else "-"}</p>
     <p><b>Fecha y hora:</b> {fmt_dt(last_point["fecha"]) if last_point else "-"}</p>
+    """
+
+    post_html = f"""
+    <p><b>Último reparto detectado:</b> {escape(post_info["ultimo_reparto"])}</p>
+    <p><b>Destino posterior:</b> {escape(post_info["destino_posterior"])}</p>
+    <p><b>¿Volvió a base?</b> {escape(post_info["volvio_a_base"])}</p>
     """
 
     html = f"""
@@ -587,6 +679,9 @@ def render_paradas_result(route_df, stops_df, compare_df, base, last_point):
             text-align: center;
             color: #12395b;
         }}
+        h1 {{
+            color: white;
+        }}
         table {{
             width: 100%;
             border-collapse: collapse;
@@ -624,8 +719,8 @@ def render_paradas_result(route_df, stops_df, compare_df, base, last_point):
     <body>
         <div class="wrap">
             <div class="hero">
-                <h1 style="color:white;">RESULTADO DEL ANÁLISIS DE PARADAS</h1>
-                <p>Comparación entre hoja de ruta y detenciones reales del camión.</p>
+                <h1>RESULTADO DEL ANÁLISIS DE PARADAS</h1>
+                <p>Comparación entre múltiples hojas de ruta y detenciones reales del camión.</p>
             </div>
 
             <div class="section">
@@ -634,7 +729,7 @@ def render_paradas_result(route_df, stops_df, compare_df, base, last_point):
             </div>
 
             <div class="section">
-                <h2>DIRECCIONES EXTRAÍDAS DE LA HOJA DE RUTA</h2>
+                <h2>DIRECCIONES EXTRAÍDAS DE LAS HOJAS DE RUTA</h2>
                 {route_table}
             </div>
 
@@ -651,6 +746,11 @@ def render_paradas_result(route_df, stops_df, compare_df, base, last_point):
             <div class="section">
                 <h2>ÚLTIMO PUNTO DEL RECORRIDO</h2>
                 {last_html}
+            </div>
+
+            <div class="section">
+                <h2>DESTINO POSTERIOR AL ÚLTIMO REPARTO</h2>
+                {post_html}
             </div>
 
             <div class="actions">
@@ -682,32 +782,32 @@ def paradas():
         return PARADAS_FORM_HTML
 
     try:
-        gps_file = request.files["gps"]
-        hoja_file = request.files["hoja"]
+        gps_file = request.files.get("gps")
+        hojas_files = request.files.getlist("hojas")
+
+        if gps_file is None or gps_file.filename == "":
+            return html_error("Error", "Falta subir el histórico de recorrido.", "/paradas")
+
+        hojas_files = [f for f in hojas_files if f and f.filename]
+        if not hojas_files:
+            return html_error("Error", "Tenés que subir al menos una hoja de ruta PDF.", "/paradas")
 
         gps_df = read_dataframe(gps_file)
         gps = prepare_gps(gps_df)
 
-        route_df = extract_addresses_from_route_pdf(hoja_file)
+        route_df = extract_addresses_from_route_pdfs(hojas_files)
         stops_df = detect_stops(gps)
         base = detect_base(stops_df)
         last_point = detect_last_point(gps)
         compare_df = compare_route_vs_stops(route_df, stops_df)
+        post_info = detect_post_last_delivery(compare_df, stops_df, base)
 
-        return render_paradas_result(route_df, stops_df, compare_df, base, last_point)
+        return render_paradas_result(route_df, stops_df, compare_df, base, last_point, post_info)
 
     except Exception as e:
-        return f"""
-        <html>
-        <head><meta charset="utf-8"><title>Error</title></head>
-        <body style="font-family:Arial; margin:24px;">
-            <h2>Error procesando el análisis de paradas</h2>
-            <pre>{escape(str(e))}</pre>
-            <p><a href="/paradas">Volver</a></p>
-        </body>
-        </html>
-        """
+        return html_error("Error procesando el análisis de paradas", str(e), "/paradas")
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)

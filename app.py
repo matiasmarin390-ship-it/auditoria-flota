@@ -6,7 +6,6 @@ from math import radians, cos, sin, asin, sqrt
 from flask import Flask, request
 import pandas as pd
 
-# Import protegido para que la app arranque aunque falte la librería
 try:
     import pdfplumber
     PDFPLUMBER_OK = True
@@ -71,12 +70,51 @@ def find_col(df, candidates):
 def html_error(title, message, back="/"):
     return f"""
     <html>
-    <head><meta charset="utf-8"><title>Error</title></head>
-    <body style="font-family:Arial; margin:24px; background:#f4f7fb;">
-        <div style="max-width:900px; margin:auto; background:white; padding:24px; border-radius:18px; box-shadow:0 8px 24px rgba(15,23,42,.08);">
-            <h2 style="color:#12395b;">{title}</h2>
-            <pre style="white-space:pre-wrap; font-family:Consolas, monospace; background:#f8fafc; padding:16px; border-radius:12px;">{message}</pre>
-            <p><a href="{back}" style="color:#0f62fe; font-weight:bold;">Volver</a></p>
+    <head>
+        <meta charset="utf-8">
+        <title>Error</title>
+        <style>
+            body {{
+                margin: 0;
+                font-family: Arial, sans-serif;
+                background: #eef3f8;
+                color: #1f2937;
+            }}
+            .wrap {{
+                max-width: 980px;
+                margin: 40px auto;
+                padding: 24px;
+            }}
+            .card {{
+                background: white;
+                padding: 28px;
+                border-radius: 24px;
+                box-shadow: 0 8px 24px rgba(15,23,42,.08);
+            }}
+            h2 {{
+                color: #12395b;
+                margin-top: 0;
+            }}
+            pre {{
+                white-space: pre-wrap;
+                font-family: Consolas, monospace;
+                background: #f8fafc;
+                padding: 16px;
+                border-radius: 12px;
+            }}
+            a {{
+                color: #0f62fe;
+                font-weight: bold;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <div class="card">
+                <h2>{title}</h2>
+                <pre>{message}</pre>
+                <p><a href="{back}">Volver</a></p>
+            </div>
         </div>
     </body>
     </html>
@@ -84,7 +122,7 @@ def html_error(title, message, back="/"):
 
 
 # =========================================
-# LECTURA DE ARCHIVOS
+# FILE READERS
 # =========================================
 def read_dataframe(upload):
     if upload is None or upload.filename == "":
@@ -216,34 +254,62 @@ def prepare_gps(df):
     col_fecha = find_col(df, ["fecha", "datetime", "time"])
     col_lat = find_col(df, ["latitud", "latitude", "lat"])
     col_lon = find_col(df, ["longitud", "longitude", "lon", "lng"])
+    col_pos = find_col(df, ["posiciones", "posicion", "position"])
     col_vel = find_col(df, ["velocidad", "speed"])
     col_dir = find_col(df, ["direccion", "dirección", "address", "ubicacion", "ubicación", "location", "calle", "domicilio"])
 
-    if not col_fecha or not col_lat or not col_lon:
-        raise Exception(
-            f"El histórico debe tener fecha, latitud y longitud. Detectadas: {list(df.columns)}"
-        )
+    if not col_fecha:
+        raise Exception(f"No encontré columna de fecha. Columnas: {list(df.columns)}")
 
     gps = df.copy()
     gps[col_fecha] = pd.to_datetime(gps[col_fecha], errors="coerce")
-    gps[col_lat] = pd.to_numeric(gps[col_lat], errors="coerce")
-    gps[col_lon] = pd.to_numeric(gps[col_lon], errors="coerce")
+
+    if col_lat and col_lon:
+        gps[col_lat] = pd.to_numeric(gps[col_lat], errors="coerce")
+        gps[col_lon] = pd.to_numeric(gps[col_lon], errors="coerce")
+        gps["_lat"] = gps[col_lat]
+        gps["_lon"] = gps[col_lon]
+
+    elif col_pos:
+        def parse_pos(x):
+            try:
+                if pd.isna(x):
+                    return None, None
+
+                txt = str(x).strip()
+                txt = txt.replace(";", ",").replace("  ", " ")
+                txt = txt.replace(" ", "")
+
+                if "," in txt:
+                    lat, lon = txt.split(",", 1)
+                    return float(lat), float(lon)
+            except Exception:
+                pass
+            return None, None
+
+        gps[["_lat", "_lon"]] = gps[col_pos].apply(lambda x: pd.Series(parse_pos(x)))
+
+    else:
+        raise Exception(
+            f"El histórico debe tener lat/lon o columna 'Posiciones'. Detectadas: {list(df.columns)}"
+        )
 
     if col_vel:
         gps[col_vel] = pd.to_numeric(gps[col_vel], errors="coerce")
+        gps["_vel"] = gps[col_vel]
+    else:
+        gps["_vel"] = 0
 
-    gps["_fecha"] = gps[col_fecha]
-    gps["_lat"] = gps[col_lat]
-    gps["_lon"] = gps[col_lon]
-    gps["_vel"] = gps[col_vel] if col_vel else 0
     gps["_direccion"] = gps[col_dir].astype(str) if col_dir else ""
+    gps["_fecha"] = gps[col_fecha]
 
     gps = gps.dropna(subset=["_fecha", "_lat", "_lon"]).sort_values("_fecha").reset_index(drop=True)
 
     gps["_lat_prev"] = gps["_lat"].shift()
     gps["_lon_prev"] = gps["_lon"].shift()
     gps["_dist_m"] = gps.apply(
-        lambda r: haversine(r["_lat"], r["_lon"], r["_lat_prev"], r["_lon_prev"]) if pd.notna(r["_lat_prev"]) else 0,
+        lambda r: haversine(r["_lat"], r["_lon"], r["_lat_prev"], r["_lon_prev"])
+        if pd.notna(r["_lat_prev"]) else 0,
         axis=1
     )
 
@@ -406,22 +472,22 @@ def detect_post_last_delivery(compare_df, stops_df, base):
     next_stop = after.sort_values("inicio").iloc[0]
     post_dest = next_stop["direccion_gps"] if next_stop["direccion_gps"] else "Parada sin dirección"
 
-    volvió = "No"
+    volvio = "No"
     if base:
         dist = haversine(next_stop["lat"], next_stop["lon"], base["lat"], base["lon"])
         if dist is not None and dist <= BASE_RADIUS_METERS:
-            volvió = "Sí"
+            volvio = "Sí"
 
     return {
         "ultimo_reparto": f'{last_delivery["direccion_hoja"]} - {last_delivery["localidad_hoja"]}',
         "destino_posterior": post_dest,
-        "volvio_a_base": volvió
+        "volvio_a_base": volvio
     }
 
 
-# =========================
+# =========================================
 # HTML
-# =========================
+# =========================================
 HOME_HTML = """
 <!DOCTYPE html>
 <html>

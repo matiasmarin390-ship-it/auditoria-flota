@@ -18,7 +18,7 @@ app = Flask(__name__)
 # =========================================
 # CONFIG
 # =========================================
-STOP_DISTANCE_METERS = 10
+STOP_DISTANCE_METERS = 15
 STOP_MINUTES = 3
 BASE_RADIUS_METERS = 100
 
@@ -132,7 +132,14 @@ def read_dataframe(upload):
 
     if name.endswith(".xlsx") or name.endswith(".xls"):
         upload.seek(0)
-        return pd.read_excel(upload)
+        xls = pd.ExcelFile(upload)
+
+        # prioridad a Resultados
+        if "Resultados" in xls.sheet_names:
+            return pd.read_excel(upload, sheet_name="Resultados")
+
+        # fallback
+        return pd.read_excel(upload, sheet_name=xls.sheet_names[0])
 
     upload.seek(0)
     raw = upload.read()
@@ -248,51 +255,38 @@ def extract_addresses_from_route_pdfs(upload_list):
 
 
 # =========================================
-# PREPARAR GPS
+# PREPARAR GPS DESDE HOJA RESULTADOS
 # =========================================
 def prepare_gps(df):
     col_fecha = find_col(df, ["fecha", "datetime", "time"])
-    col_lat = find_col(df, ["latitud", "latitude", "lat"])
-    col_lon = find_col(df, ["longitud", "longitude", "lon", "lng"])
-    col_pos = find_col(df, ["posiciones", "posicion", "position"])
+    col_coord = find_col(df, ["coordenadas", "coordenada"])
     col_vel = find_col(df, ["velocidad", "speed"])
-    col_dir = find_col(df, ["direccion", "dirección", "address", "ubicacion", "ubicación", "location", "calle", "domicilio"])
+    col_evento = find_col(df, ["evento"])
+    col_ubic = find_col(df, ["ubicación", "ubicacion", "address", "direccion", "dirección", "location"])
 
     if not col_fecha:
         raise Exception(f"No encontré columna de fecha. Columnas: {list(df.columns)}")
 
+    if not col_coord:
+        raise Exception(f"No encontré columna de coordenadas. Columnas: {list(df.columns)}")
+
     gps = df.copy()
     gps[col_fecha] = pd.to_datetime(gps[col_fecha], errors="coerce")
 
-    if col_lat and col_lon:
-        gps[col_lat] = pd.to_numeric(gps[col_lat], errors="coerce")
-        gps[col_lon] = pd.to_numeric(gps[col_lon], errors="coerce")
-        gps["_lat"] = gps[col_lat]
-        gps["_lon"] = gps[col_lon]
+    def parse_coord(x):
+        try:
+            if pd.isna(x):
+                return None, None
+            txt = str(x).strip().replace(",", " ")
+            txt = re.sub(r"\s+", " ", txt)
+            parts = txt.split(" ")
+            if len(parts) >= 2:
+                return float(parts[0]), float(parts[1])
+        except Exception:
+            pass
+        return None, None
 
-    elif col_pos:
-        def parse_pos(x):
-            try:
-                if pd.isna(x):
-                    return None, None
-
-                txt = str(x).strip()
-                txt = txt.replace(";", ",").replace("  ", " ")
-                txt = txt.replace(" ", "")
-
-                if "," in txt:
-                    lat, lon = txt.split(",", 1)
-                    return float(lat), float(lon)
-            except Exception:
-                pass
-            return None, None
-
-        gps[["_lat", "_lon"]] = gps[col_pos].apply(lambda x: pd.Series(parse_pos(x)))
-
-    else:
-        raise Exception(
-            f"El histórico debe tener lat/lon o columna 'Posiciones'. Detectadas: {list(df.columns)}"
-        )
+    gps[["_lat", "_lon"]] = gps[col_coord].apply(lambda x: pd.Series(parse_coord(x)))
 
     if col_vel:
         gps[col_vel] = pd.to_numeric(gps[col_vel], errors="coerce")
@@ -300,7 +294,8 @@ def prepare_gps(df):
     else:
         gps["_vel"] = 0
 
-    gps["_direccion"] = gps[col_dir].astype(str) if col_dir else ""
+    gps["_evento"] = gps[col_evento].astype(str) if col_evento else ""
+    gps["_direccion"] = gps[col_ubic].astype(str) if col_ubic else ""
     gps["_fecha"] = gps[col_fecha]
 
     gps = gps.dropna(subset=["_fecha", "_lat", "_lon"]).sort_values("_fecha").reset_index(drop=True)
@@ -343,6 +338,11 @@ def detect_stops(gps):
                 mode = g["_direccion"].mode()
                 direction = normalize_text(mode.iloc[0]) if not mode.empty else ""
 
+            evento_mode = ""
+            if "_evento" in g.columns:
+                em = g["_evento"].mode()
+                evento_mode = normalize_text(em.iloc[0]) if not em.empty else ""
+
             stops.append({
                 "inicio": ini,
                 "fin": fin,
@@ -351,6 +351,7 @@ def detect_stops(gps):
                 "lat": g["_lat"].mean(),
                 "lon": g["_lon"].mean(),
                 "direccion_gps": direction,
+                "evento": evento_mode
             })
 
     return pd.DataFrame(stops)
@@ -378,7 +379,8 @@ def detect_last_point(gps):
         "fecha": last["_fecha"],
         "lat": last["_lat"],
         "lon": last["_lon"],
-        "direccion": normalize_text(last["_direccion"]) if normalize_text(last["_direccion"]) else "Dirección no disponible"
+        "direccion": normalize_text(last["_direccion"]) if normalize_text(last["_direccion"]) else "Dirección no disponible",
+        "evento": normalize_text(last["_evento"]) if normalize_text(last["_evento"]) else "-"
     }
 
 
@@ -395,6 +397,7 @@ def compare_route_vs_stops(route_df, stops_df):
         out["parada_asociada"] = "-"
         out["hora_parada"] = "-"
         out["duracion_parada"] = "-"
+        out["evento_detectado"] = "-"
         return out
 
     rows = []
@@ -426,6 +429,7 @@ def compare_route_vs_stops(route_df, stops_df):
                 "parada_asociada": matched["direccion_gps"] if matched["direccion_gps"] else "Parada detectada",
                 "hora_parada": fmt_dt(matched["inicio"]),
                 "duracion_parada": matched["duracion"],
+                "evento_detectado": matched["evento"] if matched["evento"] else "-"
             })
         else:
             rows.append({
@@ -436,6 +440,7 @@ def compare_route_vs_stops(route_df, stops_df):
                 "parada_asociada": "-",
                 "hora_parada": "-",
                 "duracion_parada": "-",
+                "evento_detectado": "-"
             })
 
     return pd.DataFrame(rows)
@@ -664,7 +669,7 @@ PARADAS_FORM_HTML = """
         <h1>ANÁLISIS DE PARADAS</h1>
         <form method="post" enctype="multipart/form-data">
             <div class="field">
-                <label>Histórico de recorrido</label>
+                <label>Histórico de recorrido (Excel hoja Resultados)</label>
                 <input type="file" name="gps" required>
             </div>
             <div class="field">
@@ -684,9 +689,9 @@ PARADAS_FORM_HTML = """
 def render_paradas_result(route_df, stops_df, compare_df, base, last_point, post_info):
     route_table = route_df.to_html(index=False, border=0) if not route_df.empty else "<p>No se detectaron direcciones en las hojas.</p>"
 
-    stops_show = stops_df[["inicio", "fin", "duracion", "direccion_gps"]].copy() if not stops_df.empty else pd.DataFrame()
+    stops_show = stops_df[["inicio", "fin", "duracion", "direccion_gps", "evento"]].copy() if not stops_df.empty else pd.DataFrame()
     if not stops_show.empty:
-        stops_show.columns = ["Inicio", "Fin", "Duración", "Dirección detectada"]
+        stops_show.columns = ["Inicio", "Fin", "Duración", "Dirección detectada", "Evento detectado"]
     stops_table = stops_show.to_html(index=False, border=0) if not stops_show.empty else "<p>No se detectaron paradas.</p>"
 
     compare_table = compare_df.to_html(index=False, border=0) if not compare_df.empty else "<p>Sin comparación.</p>"
@@ -700,6 +705,7 @@ def render_paradas_result(route_df, stops_df, compare_df, base, last_point, post
     last_html = f"""
     <p><b>Último punto real del camión:</b> {escape(last_point["direccion"]) if last_point else "-"}</p>
     <p><b>Fecha y hora:</b> {fmt_dt(last_point["fecha"]) if last_point else "-"}</p>
+    <p><b>Evento:</b> {escape(last_point["evento"]) if last_point else "-"}</p>
     """
 
     post_html = f"""
@@ -829,9 +835,9 @@ def render_paradas_result(route_df, stops_df, compare_df, base, last_point, post
     return html
 
 
-# =========================
+# =========================================
 # ROUTES
-# =========================
+# =========================================
 @app.route("/")
 def home():
     return HOME_HTML

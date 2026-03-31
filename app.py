@@ -20,7 +20,7 @@ app = Flask(__name__)
 MAX_CAMIONES = 10
 VELOCIDAD_MOVIMIENTO = 3
 UMBRAL_DETENCION_MIN = 6
-UMBRAL_CAMBIO_COMBUSTIBLE = 5.0
+UMBRAL_CAMBIO_COMBUSTIBLE = 15.0
 UMBRAL_DETENCION_COMBUSTIBLE_MIN = 6
 MAX_WAYPOINTS_MAPS = 8
 VELOCIDAD_EXCESO_DEFAULT = 80
@@ -441,6 +441,7 @@ def procesar_camion(alias, tipo, sensores_file, historico_file, velocidad_limite
         "Km": total_km,
         "Tiempo_total": fmt_duracion_min(tiempo_total_min),
         "Tiempo_movimiento": fmt_duracion_min(tiempo_mov_min),
+        "Tiempo_movimiento_min": round(tiempo_mov_min, 2),
         "Tiempo_detenido": fmt_duracion_min(tiempo_det_min),
         "Velocidad_promedio": vel_prom,
         "Velocidad_máxima": vel_max,
@@ -525,25 +526,24 @@ def construir_dataframe_comparacion(camiones, modo):
     out["Nivel_eficiencia"] = out["Score_eficiencia"].apply(etiqueta)
     out["Grupo_comparado"] = out[group_key]
 
-    columnas = [
-        "Grupo_comparado", "Ranking_grupo", "Camión", "Tipo", "Km", "Tiempo_movimiento",
-        "Velocidad_promedio", "% puntos con exceso", "Consumo_aprox_pct", "Consumo_pct_por_km",
+    columnas_visibles = [
+        "Camión", "Tipo", "Km", "Tiempo_movimiento",
+        "Velocidad_promedio", "% puntos con exceso",
         "Rendimiento_km_h", "Score_eficiencia", "Nivel_eficiencia"
     ]
-    return out[columnas].copy()
+    columnas_internas = columnas_visibles + ["Tiempo_movimiento_min"]
+    return out[columnas_internas].copy()
 
 
 def construir_resumen_global(df_comp):
     if df_comp.empty:
         return {}
     mejor = df_comp.sort_values(["Score_eficiencia", "Km"], ascending=[False, False]).iloc[0]
-    menor_consumo = df_comp.sort_values(["Consumo_pct_por_km", "Score_eficiencia"], ascending=[True, False], na_position="last").iloc[0]
-    mayor_rapidez = df_comp.sort_values(["Rendimiento_km_h", "Score_eficiencia"], ascending=[False, False], na_position="last").iloc[0]
+    mejor_tiempo = df_comp.sort_values(["Tiempo_movimiento_min", "Km"], ascending=[True, False], na_position="last").iloc[0]
     mejor_velocidad = df_comp.sort_values(["% puntos con exceso", "Score_eficiencia"], ascending=[True, False]).iloc[0]
     return {
         "Mejor score general": f"{mejor['Camión']} ({mejor['Score_eficiencia']})",
-        "Menor consumo por km": f"{menor_consumo['Camión']} ({menor_consumo['Consumo_pct_por_km']})",
-        "Mayor rendimiento km/h": f"{mayor_rapidez['Camión']} ({mayor_rapidez['Rendimiento_km_h']})",
+        "Mejor tiempo de trabajo": f"{mejor_tiempo['Camión']} ({mejor_tiempo['Tiempo_movimiento']})",
         "Mejor respeto de velocidad": f"{mejor_velocidad['Camión']} ({mejor_velocidad['% puntos con exceso']}% exceso)",
     }
 
@@ -584,7 +584,7 @@ def build_pdf(report):
 
     story.append(Spacer(1, 8))
     story.append(Paragraph("TABLA COMPARATIVA", h2))
-    table = Table(row_to_pdf_table(report["comparacion"]), repeatRows=1)
+    table = Table(row_to_pdf_table(report["comparacion"][["Camión", "Tipo", "Km", "Tiempo_movimiento", "Velocidad_promedio", "% puntos con exceso", "Rendimiento_km_h", "Score_eficiencia", "Nivel_eficiencia"]]), repeatRows=1)
     table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#18324a")),
         ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -770,7 +770,7 @@ def render_result(report_id, comparacion, resumen_global, observaciones, camione
             body {{ margin:0; font-family:"Segoe UI", Arial, sans-serif; background:linear-gradient(180deg,#eef3f8 0%,#f8fafc 100%); color:#0f172a; }}
             .container {{ max-width:1320px; margin:28px auto; padding:24px; }}
             .hero {{ background:linear-gradient(135deg,#0f2d46,#1e4d73); color:white; border-radius:34px; padding:34px; margin-bottom:24px; text-align:center; box-shadow:0 18px 44px rgba(15,23,42,.18); }}
-            .summary-grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:18px; margin-bottom:26px; }}
+            .summary-grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:18px; margin-bottom:26px; }}
             .metric {{ background:rgba(255,255,255,.92); border-radius:24px; padding:20px; border:1px solid rgba(203,213,225,.7); box-shadow:0 10px 30px rgba(15,23,42,.08); }}
             .metric .label {{ font-size:12px; color:#64748b; margin-bottom:8px; text-transform:uppercase; letter-spacing:.08em; font-weight:700; }}
             .metric .value {{ font-size:24px; font-weight:800; color:#0f172a; }}
@@ -800,7 +800,7 @@ def render_result(report_id, comparacion, resumen_global, observaciones, camione
             <div class="section">
                 <h2>Scoring comparativo</h2>
                 <p>{escape(observaciones)}</p>
-                {html_tabla(comparacion, index=False)}
+                {html_tabla(comparacion[["Camión", "Tipo", "Km", "Tiempo_movimiento", "Velocidad_promedio", "% puntos con exceso", "Rendimiento_km_h", "Score_eficiencia", "Nivel_eficiencia"]], index=False)}
             </div>
             {''.join(tarjetas)}
             <div class="footer-actions">
@@ -884,3 +884,4 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+

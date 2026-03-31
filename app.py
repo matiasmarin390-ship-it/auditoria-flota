@@ -20,7 +20,7 @@ app = Flask(__name__)
 MAX_CAMIONES = 10
 VELOCIDAD_MOVIMIENTO = 3
 UMBRAL_DETENCION_MIN = 6
-UMBRAL_CAMBIO_COMBUSTIBLE = 15.0
+UMBRAL_CAMBIO_COMBUSTIBLE = 10.0
 UMBRAL_DETENCION_COMBUSTIBLE_MIN = 6
 MAX_WAYPOINTS_MAPS = 8
 VELOCIDAD_EXCESO_DEFAULT = 80
@@ -282,7 +282,26 @@ def detectar_sensor_combustible(sens, sm):
     return fallback[0] if fallback else None
 
 
-def consumo_aproximado_pct(sensor_df, valor_col):
+def combustible_en_litros(sensor_df, valor_col, sensor_nombre, capacidad_tanque_litros=None):
+    serie = sensor_df.dropna(subset=[valor_col]).copy()
+    nombre = norm(sensor_nombre)
+    capacidad = safe_float(capacidad_tanque_litros)
+    es_porcentaje = "%" in nombre or "pct" in nombre or "porcentaje" in nombre
+    parece_litros = any(k in nombre for k in ["litro", "litros", " l", "(l", "[l", "nivel de combustible l"])
+
+    if es_porcentaje:
+        if capacidad is None or capacidad <= 0:
+            raise Exception("El sensor de combustible está en porcentaje. Para calcular consumo en litros debés informar la capacidad del tanque en litros para cada camión.")
+        serie[valor_col] = pd.to_numeric(serie[valor_col], errors="coerce") * capacidad / 100.0
+    elif parece_litros:
+        serie[valor_col] = pd.to_numeric(serie[valor_col], errors="coerce")
+    else:
+        # Si no se puede inferir la unidad, se asume que el sensor ya está expresado en litros.
+        serie[valor_col] = pd.to_numeric(serie[valor_col], errors="coerce")
+    return serie
+
+
+def consumo_aproximado_litros(sensor_df, valor_col):
     serie = sensor_df.dropna(subset=[valor_col]).sort_values("_fecha_tmp").copy()
     if len(serie) < 2:
         return None
@@ -291,13 +310,14 @@ def consumo_aproximado_pct(sensor_df, valor_col):
     return round(float(negativos), 2)
 
 
-def detectar_eventos_combustible(sens, sm, gps, gm):
+def detectar_eventos_combustible(sens, sm, gps, gm, capacidad_tanque_litros=None):
     col_sensor, col_fecha, col_valor = sm["sensor"], sm["fecha"], sm["valor"]
     sensor_comb = detectar_sensor_combustible(sens, sm)
     if sensor_comb is None:
         return pd.DataFrame(), None, None
 
     serie = sens[sens[col_sensor].astype(str).str.strip() == str(sensor_comb)].copy().sort_values(col_fecha)
+    serie = combustible_en_litros(serie, col_valor, sensor_comb, capacidad_tanque_litros)
     serie["prev_valor"] = serie[col_valor].shift(1)
     serie["delta"] = serie[col_valor] - serie["prev_valor"]
     serie["delta_min"] = (serie[col_fecha] - serie[col_fecha].shift(1)).dt.total_seconds() / 60
@@ -316,7 +336,7 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
 
     eventos = serie_merge[serie_merge["delta"].abs() >= UMBRAL_CAMBIO_COMBUSTIBLE].copy()
     if eventos.empty:
-        return pd.DataFrame(), sensor_comb, consumo_aproximado_pct(serie, col_valor)
+        return pd.DataFrame(), sensor_comb, consumo_aproximado_litros(serie, col_valor)
 
     clasifs, maps = [], []
     for _, r in eventos.iterrows():
@@ -338,9 +358,10 @@ def detectar_eventos_combustible(sens, sm, gps, gm):
     eventos["Google_Maps"] = maps
     out = eventos[[col_fecha, "prev_valor", col_valor, "delta", "delta_min", "Google_Maps", "Clasificación"]].copy()
     out.columns = ["Fecha_hora", "Nivel_antes", "Nivel_después", "Variación", "Duración_evento_min", "Google_Maps", "Clasificación"]
+    out[["Nivel_antes", "Nivel_después", "Variación"]] = out[["Nivel_antes", "Nivel_después", "Variación"]].round(2)
     out["Duración_evento"] = out["Duración_evento_min"].apply(fmt_duracion_min)
     out["Google_Maps"] = out["Google_Maps"].apply(lambda x: f'<a href="{x}" target="_blank">Ver mapa</a>' if x else "")
-    return out[["Fecha_hora", "Nivel_antes", "Nivel_después", "Variación", "Duración_evento", "Google_Maps", "Clasificación"]], sensor_comb, consumo_aproximado_pct(serie, col_valor)
+    return out[["Fecha_hora", "Nivel_antes", "Nivel_después", "Variación", "Duración_evento", "Google_Maps", "Clasificación"]], sensor_comb, consumo_aproximado_litros(serie, col_valor)
 
 
 def detectar_detenciones(gps, gm):
@@ -399,7 +420,7 @@ def inferir_firma_circuito(gps, gm, total_km):
     }
 
 
-def procesar_camion(alias, tipo, sensores_file, historico_file, velocidad_limite):
+def procesar_camion(alias, tipo, sensores_file, historico_file, velocidad_limite, capacidad_tanque_litros=None):
     df_s_raw = leer_archivo_flexible(sensores_file)
     df_g_raw = leer_archivo_flexible(historico_file)
 
@@ -427,8 +448,8 @@ def procesar_camion(alias, tipo, sensores_file, historico_file, velocidad_limite
     exceso_count = int((pd.to_numeric(gps[gv], errors="coerce") > velocidad_limite).sum()) if gv and gv in gps.columns else 0
     pct_exceso = round((exceso_count / len(gps)) * 100, 2) if len(gps) else 0
 
-    eventos_comb, sensor_comb, consumo_pct = detectar_eventos_combustible(sens, sm, gps, gm)
-    consumo_por_km = round(consumo_pct / total_km, 4) if consumo_pct is not None and total_km > 0 else None
+    eventos_comb, sensor_comb, consumo_litros = detectar_eventos_combustible(sens, sm, gps, gm, capacidad_tanque_litros)
+    consumo_por_km = round(consumo_litros / total_km, 4) if consumo_litros is not None and total_km > 0 else None
 
     recorrido_maps = maps_route_url(gps)
     firma = inferir_firma_circuito(gps, gm, total_km)
@@ -448,8 +469,8 @@ def procesar_camion(alias, tipo, sensores_file, historico_file, velocidad_limite
         "% puntos con exceso": pct_exceso,
         "Eventos_combustible": len(eventos_comb),
         "Sensor_combustible": sensor_comb or "No detectado",
-        "Consumo_aprox_pct": consumo_pct,
-        "Consumo_pct_por_km": consumo_por_km,
+        "Consumo_aprox_litros": consumo_litros,
+        "Consumo_litros_por_km": consumo_por_km,
         "Rendimiento_km_h": eficiencia_tiempo,
         "Firma_circuito": firma["firma_circuito"],
         "Firma_dia": firma["firma_dia"],
@@ -492,7 +513,7 @@ def construir_dataframe_comparacion(camiones, modo):
     resultados = []
     for _, grupo in df.groupby(group_key):
         g = grupo.copy()
-        g["score_consumo"] = percent_rank(g["Consumo_pct_por_km"], higher_is_better=False)
+        g["score_consumo"] = percent_rank(g["Consumo_litros_por_km"], higher_is_better=False)
         g["score_tiempo"] = percent_rank(g["Rendimiento_km_h"], higher_is_better=True)
         g["score_velocidad"] = percent_rank(g["% puntos con exceso"], higher_is_better=False)
         g["score_promedio"] = percent_rank(g["Velocidad_promedio"], higher_is_better=False)
@@ -675,6 +696,10 @@ def render_form():
                                     <input type="number" name="limite_${'{'}i{'}'}" value="{VELOCIDAD_EXCESO_DEFAULT}" min="1">
                                 </div>
                                 <div class="field">
+                                    <label>Capacidad de tanque (litros)</label>
+                                    <input type="number" step="0.01" name="tanque_${'{'}i{'}'}" placeholder="Ej: 300">
+                                </div>
+                                <div class="field">
                                     <label>Archivo sensores</label>
                                     <input type="file" name="sensores_${'{'}i{'}'}" required>
                                 </div>
@@ -694,7 +719,7 @@ def render_form():
         <div class="wrapper">
             <div class="hero">
                 <h1>Auditoría comparativa multicamión</h1>
-                <p>Cargá de 1 a {MAX_CAMIONES} camiones, cada uno con su archivo de sensores y su histórico GPS. La app compara consumo, kilómetros, velocidad, tiempos y genera un scoring de eficiencia.</p>
+                <p>Cargá de 1 a {MAX_CAMIONES} camiones, cada uno con su archivo de sensores y su histórico GPS. La app compara consumo en litros, kilómetros, velocidad, tiempos y genera un scoring de eficiencia.</p>
             </div>
             <div class="card">
                 <form method="post" enctype="multipart/form-data">
@@ -723,7 +748,7 @@ def render_form():
                 </form>
                 <div class="help">
                     <b>Cómo compara:</b> normaliza los datos por km cuando aplica, arma ranking por grupo según el modo elegido y permite analizar distintos días o circuitos sin perder una métrica comparable.<br>
-                    <b>Formatos compatibles:</b> CSV, XLSX y XLS.
+                    <b>Formatos compatibles:</b> CSV, XLSX y XLS.<br><b>Importante:</b> si el sensor de combustible viene en %, cargá la capacidad del tanque para convertir el consumo a litros.
                 </div>
             </div>
         </div>
@@ -749,7 +774,7 @@ def render_result(report_id, comparacion, resumen_global, observaciones, camione
                     <div class="metric"><div class="label">Tipo</div><div class="value">{escape(str(r['Tipo']))}</div></div>
                     <div class="metric"><div class="label">Km</div><div class="value">{r['Km']}</div></div>
                     <div class="metric"><div class="label">Vel. promedio</div><div class="value">{r['Velocidad_promedio']}</div></div>
-                    <div class="metric"><div class="label">Consumo aprox %</div><div class="value">{r['Consumo_aprox_pct']}</div></div>
+                    <div class="metric"><div class="label">Consumo aprox litros</div><div class="value">{r['Consumo_aprox_litros']}</div></div>
                 </div>
                 <p><b>Período:</b> {escape(str(r['Período']))}</p>
                 <p><b>Tiempo movimiento:</b> {escape(str(r['Tiempo_movimiento']))} | <b>Tiempo detenido:</b> {escape(str(r['Tiempo_detenido']))}</p>
@@ -834,11 +859,13 @@ def index():
             alias = (request.form.get(f"alias_{i}") or f"Camión {i}").strip()
             tipo = (request.form.get(f"tipo_{i}") or "No informado").strip()
             limite = int(request.form.get(f"limite_{i}", str(VELOCIDAD_EXCESO_DEFAULT)) or VELOCIDAD_EXCESO_DEFAULT)
+            tanque = request.form.get(f"tanque_{i}", "").strip()
+            capacidad_tanque_litros = float(tanque) if tanque else None
             sensores = request.files.get(f"sensores_{i}")
             historico = request.files.get(f"historico_{i}")
             if not sensores or not historico:
                 raise Exception(f"Faltan archivos en el camión {i}.")
-            camiones.append(procesar_camion(alias, tipo, sensores, historico, limite))
+            camiones.append(procesar_camion(alias, tipo, sensores, historico, limite, capacidad_tanque_litros))
 
         comparacion = construir_dataframe_comparacion(camiones, modo)
         resumen_global = construir_resumen_global(comparacion)
@@ -858,8 +885,8 @@ def index():
                         "Km": c["resumen"]["Km"],
                         "Velocidad promedio": c["resumen"]["Velocidad_promedio"],
                         "Velocidad máxima": c["resumen"]["Velocidad_máxima"],
-                        "Consumo aprox %": c["resumen"]["Consumo_aprox_pct"],
-                        "Consumo % por km": c["resumen"]["Consumo_pct_por_km"],
+                        "Consumo aprox litros": c["resumen"]["Consumo_aprox_litros"],
+                        "Consumo litros por km": c["resumen"]["Consumo_litros_por_km"],
                         "Rendimiento km/h": c["resumen"]["Rendimiento_km_h"],
                         "% puntos con exceso": c["resumen"]["% puntos con exceso"],
                     },
@@ -884,4 +911,3 @@ def index():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
